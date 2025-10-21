@@ -23,11 +23,25 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
     <div class="transponder-tabs">
         <div class="tabs-container">
             <?php foreach ($transports as $transport): ?>
-                <button class="tab <?= $transport['id'] === $activeTransport ? 'active' : '' ?>" 
-                        onclick="switchTransport('<?= $transport['id'] ?>')">
-                    <?= htmlspecialchars($transport['name']) ?>
-                    <span class="tab-status status-<?= $transport['status'] ?>"></span>
-                </button>
+                <div class="tab-wrapper">
+                    <button class="tab <?= $transport['id'] === $activeTransport ? 'active' : '' ?>"
+                            onclick="switchTransport('<?= $transport['id'] ?>')">
+                        <?= htmlspecialchars($transport['name']) ?>
+                        <span class="tab-status status-<?= $transport['status'] ?>"></span>
+                    </button>
+                    <div class="tab-actions">
+                        <button class="tab-action-btn"
+                                onclick="event.stopPropagation(); transportConfig.editTransport('<?= $transport['id'] ?>')"
+                                title="Edit Transport">
+                            ✏️
+                        </button>
+                        <button class="tab-action-btn delete-btn"
+                                onclick="event.stopPropagation(); transportConfig.deleteTransport('<?= $transport['id'] ?>', '<?= htmlspecialchars($transport['name']) ?>')"
+                                title="Delete Transport">
+                            🗑️
+                        </button>
+                    </div>
+                </div>
             <?php endforeach; ?>
             <button class="add-transponder" onclick="showAddTransportModal()">
                 + Add Transport
@@ -47,8 +61,8 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
                 <h2 class="card-title">Global Receiver Distribution</h2>
                 <div class="map-container">
                     <div class="map-placeholder">
-                        ??? Interactive World Map<br>
-                        <small style="opacity: 0.7;">Green: Satellite � Yellow: FSR � Red: Offline</small>
+                        🗺️ Interactive World Map<br>
+                        <small style="opacity: 0.7;">Green: Satellite • Yellow: FSR • Red: Offline</small>
                     </div>
                 </div>
             </div>
@@ -115,7 +129,7 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
                     <div id="output-urls">
                         <div class="output-url-group">
                             <input type="text" name="output_urls[]" placeholder="rist://@192.168.110.107:5554?weight=0&buffer=8000" required>
-                            <button type="button" class="btn-remove" onclick="removeOutputUrl(this)">�</button>
+                            <button type="button" class="btn-remove" onclick="removeOutputUrl(this)">×</button>
                         </div>
                     </div>
                     <button type="button" onclick="addOutputUrl()">+ Add Output URL</button>
@@ -143,7 +157,7 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
         // Handle transport form submission
         async function handleTransportForm(event) {
             event.preventDefault();
-            
+
             const formData = new FormData(event.target);
             const data = {
                 name: formData.get('name'),
@@ -151,30 +165,48 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
                 input_url: formData.get('input_url'),
                 output_urls: formData.getAll('output_urls[]').filter(url => url.trim() !== '')
             };
-            
+
+            // Validate data
+            const errors = transportConfig.validateTransportData(data);
+            if (errors.length > 0) {
+                alert('Validation Errors:\n\n' + errors.join('\n'));
+                return;
+            }
+
             try {
                 const submitButton = event.target.querySelector('button[type="submit"]');
                 const originalText = submitButton.textContent;
                 submitButton.disabled = true;
-                submitButton.textContent = 'Creating...';
-                
-                const response = await fetch('/api/transports.php', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-                
-                const result = await response.json();
-                
-                if (result.error) {
-                    alert('Error: ' + result.message);
+
+                // Check if we're in edit mode or create mode
+                const isEditMode = transportConfig.isEditMode();
+                const transportId = transportConfig.getEditingTransportId();
+
+                let response;
+                if (isEditMode) {
+                    // Update existing transport
+                    submitButton.textContent = 'Updating...';
+                    response = await ApiClient.put(`/transports/${transportId}`, data);
                 } else {
-                    alert('Transport created successfully!');
+                    // Create new transport
+                    submitButton.textContent = 'Creating...';
+                    response = await ApiClient.post('/transports', data);
+                }
+
+                if (response.error) {
+                    alert('Error: ' + (response.message || 'Unknown error occurred'));
+                    submitButton.disabled = false;
+                    submitButton.textContent = originalText;
+                } else {
+                    alert(isEditMode ? 'Transport updated successfully!' : 'Transport created successfully!');
                     window.closeAddTransportModal();
-                    location.reload(); // Refresh to show new transport
+                    location.reload(); // Refresh to show updated/new transport
                 }
             } catch (error) {
-                alert('Error creating transport: ' + error.message);
+                console.error('Form submission error:', error);
+                alert('Error: ' + error.message);
+                const submitButton = event.target.querySelector('button[type="submit"]');
+                submitButton.disabled = false;
             }
         }
     </script>

@@ -400,7 +400,7 @@ class Dashboard {
                 bitrate: '75.0'
             },
             'astra_19e': {
-                name: 'Astra 19.2°E',
+                name: 'Astra 19.2ï¿½E',
                 frequency: '11,739',
                 symbol_rate: '22,000',
                 bitrate: '45.0'
@@ -466,12 +466,19 @@ function switchTransport(transportId) {
 window.switchTransport = switchTransport;
 
 window.showAddTransportModal = function() {
+    // Reset to add mode
+    transportConfig.resetToAddMode();
+
+    // Show modal and load satellites
     document.getElementById('add-transport-modal').classList.add('show');
     window.loadSatellites();
 };
 
 window.closeAddTransportModal = function() {
     document.getElementById('add-transport-modal').classList.remove('show');
+
+    // Reset to add mode when closing
+    transportConfig.resetToAddMode();
 };
 
 window.loadSatellites = async function() {
@@ -500,13 +507,21 @@ window.addOutputUrl = function() {
     newGroup.className = 'output-url-group';
     newGroup.innerHTML = `
         <input type="text" name="output_urls[]" placeholder="rist://@192.168.1.107:5555?weight=1000&buffer=8000" required>
-        <button type="button" class="btn-remove" onclick="removeOutputUrl(this)">×</button>
+        <button type="button" class="btn-remove" onclick="removeOutputUrl(this)">Ã—</button>
     `;
     container.appendChild(newGroup);
 };
 
 window.removeOutputUrl = function(button) {
-    button.parentElement.remove();
+    // Only allow removal if there's more than one output URL
+    const container = document.getElementById('output-urls');
+    const groups = container.querySelectorAll('.output-url-group');
+
+    if (groups.length > 1) {
+        button.parentElement.remove();
+    } else {
+        alert('At least one output URL is required');
+    }
 };
 
 window.toggleSwitch = function(element) {
