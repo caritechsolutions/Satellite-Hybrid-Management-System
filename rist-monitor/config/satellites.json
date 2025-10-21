@@ -1,0 +1,22 @@
+{
+  "satellites": [
+    {
+      "id": "eutelsat_65w",
+      "name": "Eutelsat 65W",
+      "frequency": "11450",
+      "symbol_rate": "27500",
+      "bitrate": "60.0",
+      "position": "65.0W",
+      "status": "active"
+    },
+    {
+      "id": "ses_17", 
+      "name": "SES-17",
+      "frequency": "12050",
+      "symbol_rate": "30000",
+      "bitrate": "75.0",
+      "position": "67.1W",
+      "status": "active"
+    }
+  ]
+}

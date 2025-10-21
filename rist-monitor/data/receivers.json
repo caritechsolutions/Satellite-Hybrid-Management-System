@@ -1,0 +1,38 @@
+{
+  "receivers": [
+    {
+      "box_id": "RX001",
+      "transport_id": "eutelsat65w_main",
+      "location": "New York, NY, USA",
+      "ip_address": "192.168.1.100",
+      "status": "online",
+      "rtt": "12ms",
+      "quality": "98%",
+      "bandwidth": "45.2",
+      "packet_loss": "0.001"
+    },
+    {
+      "box_id": "RX002", 
+      "transport_id": "eutelsat65w_main",
+      "location": "London, UK",
+      "ip_address": "192.168.1.101",
+      "status": "fsr",
+      "rtt": "85ms",
+      "quality": "95%",
+      "bandwidth": "42.1",
+      "packet_loss": "0.05"
+    },
+    {
+      "box_id": "RX003",
+      "transport_id": "eutelsat65w_main", 
+      "location": "Tokyo, Japan",
+      "ip_address": "192.168.1.102",
+      "status": "offline",
+      "rtt": "-",
+      "quality": "0%",
+      "bandwidth": "0",
+      "packet_loss": "100"
+    }
+  ],
+  "last_updated": "2025-01-01T00:00:00Z"
+}
