@@ -10,13 +10,40 @@
       "status": "active"
     },
     {
-      "id": "ses_17", 
+      "id": "ses_17",
       "name": "SES-17",
       "frequency": "12050",
       "symbol_rate": "30000",
       "bitrate": "75.0",
       "position": "67.1W",
       "status": "active"
+    },
+    {
+      "id": "astra_19e",
+      "name": "Astra 19.2E",
+      "frequency": "11739",
+      "symbol_rate": "22000",
+      "bitrate": "45.0",
+      "position": "19.2E",
+      "status": "active"
+    },
+    {
+      "id": "intelsat_35e",
+      "name": "Intelsat 35e",
+      "frequency": "11555",
+      "symbol_rate": "30000",
+      "bitrate": "72.0",
+      "position": "34.5W",
+      "status": "active"
+    },
+    {
+      "id": "hispasat_30w",
+      "name": "Hispasat 30W-6",
+      "frequency": "12092",
+      "symbol_rate": "27500",
+      "bitrate": "55.0",
+      "position": "30.0W",
+      "status": "maintenance"
     }
   ]
 }

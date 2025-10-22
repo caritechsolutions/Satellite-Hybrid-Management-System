@@ -9,7 +9,8 @@ $satellites = [];
 
 if (file_exists($satellitesFile)) {
     $satellitesData = file_get_contents($satellitesFile);
-    $satellites = json_decode($satellitesData, true) ?: [];
+    $data = json_decode($satellitesData, true) ?: [];
+    $satellites = $data['satellites'] ?? [];
 }
 ?>
 <!DOCTYPE html>
