@@ -3,6 +3,8 @@
  * Collects metrics from RIST transports and stores in Redis TimeSeries
  */
 
+#define _GNU_SOURCE  // For strdup() and other POSIX functions
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -303,8 +305,21 @@ int load_transports_from_json() {
     fseek(fp, 0, SEEK_SET);
 
     char *json = malloc(fsize + 1);
-    fread(json, 1, fsize, fp);
+    if(!json) {
+        fprintf(stderr, "Failed to allocate memory for config file\n");
+        fclose(fp);
+        return 0;
+    }
+
+    size_t bytes_read = fread(json, 1, fsize, fp);
     fclose(fp);
+
+    if(bytes_read != (size_t)fsize) {
+        fprintf(stderr, "Failed to read complete config file\n");
+        free(json);
+        return 0;
+    }
+
     json[fsize] = 0;
 
     // Simple JSON parsing (looking for running transports)
