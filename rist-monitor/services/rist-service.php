@@ -429,7 +429,7 @@ class RistService {
         $running_count = 0;
         $stopped_count = 0;
         $error_count = 0;
-        
+
         foreach ($transports as $transport) {
             $status = $this->getTransportStatus($transport['id']);
             switch ($status['status']) {
@@ -443,28 +443,76 @@ class RistService {
                     $error_count++;
             }
         }
-        
+
         return [
             'total_transports' => count($transports),
             'running' => $running_count,
             'stopped' => $stopped_count,
             'errors' => $error_count,
-            'system_load' => sys_getloadavg()[0],
+            'cpu_usage' => $this->getCPUUsage(),
             'memory_usage' => $this->getMemoryUsage(),
             'disk_usage' => $this->getDiskUsage()
         ];
     }
-    
+
+    private function getCPUUsage() {
+        // Try to get CPU usage from /proc/stat
+        if (file_exists('/proc/stat')) {
+            $stat1 = file('/proc/stat');
+            usleep(100000); // 100ms
+            $stat2 = file('/proc/stat');
+
+            $info1 = explode(" ", preg_replace("!cpu +!", "", $stat1[0]));
+            $info2 = explode(" ", preg_replace("!cpu +!", "", $stat2[0]));
+
+            $dif = array();
+            $dif['user'] = $info2[0] - $info1[0];
+            $dif['nice'] = $info2[1] - $info1[1];
+            $dif['sys'] = $info2[2] - $info1[2];
+            $dif['idle'] = $info2[3] - $info1[3];
+
+            $total = array_sum($dif);
+            $cpu = [];
+            foreach($dif as $x=>$y) $cpu[$x] = round($y / $total * 100, 1);
+
+            return round(100 - $cpu['idle'], 1);
+        }
+
+        // Fallback: use system load average
+        $load = sys_getloadavg();
+        return round(min($load[0] * 20, 100), 1); // Rough approximation
+    }
+
     private function getMemoryUsage() {
-        $free = shell_exec('free');
-        $free = (string)trim($free);
-        $free_arr = explode("\n", $free);
-        $mem = explode(" ", $free_arr[1]);
-        $mem = array_filter($mem);
-        $mem = array_merge($mem);
-        $memory_usage = $mem[2]/$mem[1]*100;
-        
-        return round($memory_usage, 2);
+        // Try Linux method first
+        if (file_exists('/proc/meminfo')) {
+            $meminfo = file_get_contents('/proc/meminfo');
+            preg_match('/MemTotal:\s+(\d+)/', $meminfo, $total_match);
+            preg_match('/MemAvailable:\s+(\d+)/', $meminfo, $available_match);
+
+            if ($total_match && $available_match) {
+                $total = $total_match[1];
+                $available = $available_match[1];
+                $used = $total - $available;
+                return round(($used / $total) * 100, 1);
+            }
+        }
+
+        // Fallback: try using 'free' command
+        $output = @shell_exec('free 2>/dev/null');
+        if ($output) {
+            $free = (string)trim($output);
+            $free_arr = explode("\n", $free);
+            if (count($free_arr) > 1) {
+                $mem = preg_split('/\s+/', $free_arr[1]);
+                if (count($mem) >= 3 && $mem[1] > 0) {
+                    return round(($mem[2] / $mem[1]) * 100, 1);
+                }
+            }
+        }
+
+        // Last resort: return 0
+        return 0;
     }
     
     private function getDiskUsage() {
