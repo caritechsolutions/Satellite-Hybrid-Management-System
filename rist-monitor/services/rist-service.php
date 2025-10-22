@@ -726,11 +726,11 @@ Restart=always
 RestartSec=5
 
 # Start ristsender first
-ExecStartPre=/bin/bash -c '{$senderCmd} > /dev/null 2>&1 &'
+ExecStartPre=/bin/bash -c "{$senderCmd} > /dev/null 2>&1 &"
 ExecStartPre=/bin/sleep 2
 
 # Start ristreceiver after ristsender is running
-ExecStart=/bin/bash -c '{$receiverCmd} > /dev/null 2>&1 &'
+ExecStart=/bin/bash -c "{$receiverCmd} > /dev/null 2>&1 &"
 
 # Stop commands
 ExecStop=/usr/bin/pkill -f "ristsender.*{$transport['id']}"
