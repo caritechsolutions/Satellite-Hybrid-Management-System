@@ -183,13 +183,13 @@
 
 1. **Enhanced Visualization**
    - Google Maps integration for receiver locations
-   - Bandwidth graphs with Chart.js
-   - Real-time metrics dashboards
+   - Real-time metrics dashboards with WebSocket
 
 2. **Advanced Management**
    - Bulk receiver operations
    - Configuration backup/restore
-   - Alert system with notifications
+   - Alert system with notifications (email/SMS)
+   - Automated failover management
 
 3. **Integration Features**
    - SCTE-35 ad insertion
@@ -205,15 +205,18 @@
 - [x] Configuration system
 - [x] Security framework
 
-### Phase 2: Real-time Integration 🔄 IN PROGRESS
-- [ ] Complete API endpoints
-- [ ] Prometheus metrics integration
-- [ ] Live receiver status updates
-- [ ] WebSocket implementation
+### Phase 2: Real-time Integration ✅ COMPLETE
+- [x] Complete API endpoints
+- [x] Prometheus metrics integration
+- [x] Live receiver status updates (5-second polling)
+- [x] Historical metrics storage (Redis TimeSeries)
+- [x] Bandwidth monitoring graphs (Chart.js)
+- [x] High-performance C metrics collector
+- [x] Systemd-based process management
 
 ### Phase 3: Advanced Features 📋 PLANNED
 - [ ] Google Maps receiver visualization
-- [ ] Bandwidth monitoring graphs
+- [ ] WebSocket real-time updates (upgrade from polling)
 - [ ] Ad insertion functionality
 - [ ] Alert and notification system
 
@@ -308,7 +311,32 @@ This is a complete web-based management interface for your RIST Part 7 Satellite
 
 ## 🛠️ Installation Steps
 
-### 1. Create Directory Structure
+### Quick Deployment (Production)
+
+Deploy the latest version from the development branch:
+
+```bash
+# Clone and deploy
+cd /tmp
+git clone https://github.com/caritechsolutions/Satellite-Hybrid-Management-System.git
+cd Satellite-Hybrid-Management-System
+git checkout claude/fix-main-page-edit-011CULbjf57qdb4TzoeFVqug
+
+# Deploy web interface
+sudo cp -r rist-monitor/* /var/www/html/rist-monitor/
+sudo chown -R www-data:www-data /var/www/html/rist-monitor
+sudo chmod -R 755 /var/www/html/rist-monitor
+
+# Install C metrics collector (for historical graphs)
+cd worker
+sudo bash install.sh
+
+# Cleanup
+cd /tmp
+rm -rf Satellite-Hybrid-Management-System
+```
+
+### 1. Create Directory Structure (First-time setup)
 
 ```bash
 sudo mkdir -p /var/www/html/rist-monitor/{config,api,assets/{css,js,images},components,services,data}
@@ -317,13 +345,38 @@ sudo chmod -R 755 /var/www/html/rist-monitor
 sudo chmod -R 777 /var/www/html/rist-monitor/{config,data}
 ```
 
-### 2. Install Required PHP Packages
+### 2. Install Required Packages
 
+#### PHP and Nginx
 ```bash
 sudo apt update
 sudo apt install php8.2-fpm php8.2-json php8.2-curl php8.2-mbstring nginx
 sudo systemctl enable php8.2-fpm nginx
 sudo systemctl start php8.2-fpm nginx
+```
+
+#### Redis with TimeSeries Module (for historical metrics)
+```bash
+# Option 1: Redis Stack (includes TimeSeries)
+docker run -d -p 6379:6379 --name redis-stack \
+  --restart unless-stopped \
+  redis/redis-stack-server:latest
+
+# Option 2: Install from package (Ubuntu 22.04+)
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+sudo apt update
+sudo apt install redis-stack-server
+sudo systemctl enable redis-stack-server
+sudo systemctl start redis-stack-server
+
+# Verify TimeSeries module is loaded
+redis-cli MODULE LIST
+```
+
+#### C Build Tools (for metrics collector)
+```bash
+sudo apt install build-essential libcurl4-openssl-dev libhiredis-dev
 ```
 
 ### 3. Configure Nginx
@@ -369,63 +422,70 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-### 4. Deploy Files
+### 4. Verify Installation
 
-Copy all the created files to their respective locations:
+After deployment, verify all services are running:
 
-- `index.php` → `/var/www/html/rist-monitor/`
-- `config/config.php` → `/var/www/html/rist-monitor/config/`
-- `services/rist-service.php` → `/var/www/html/rist-monitor/services/`
-- `api/transports.php` → `/var/www/html/rist-monitor/api/`
-- `assets/css/main.css` → `/var/www/html/rist-monitor/assets/css/`
-- `assets/css/components.css` → `/var/www/html/rist-monitor/assets/css/`
-- `assets/js/dashboard.js` → `/var/www/html/rist-monitor/assets/js/`
-- `assets/js/api-client.js` → `/var/www/html/rist-monitor/assets/js/`
-- `components/sidebar.php` → `/var/www/html/rist-monitor/components/`
+```bash
+# Check web server
+sudo systemctl status nginx php8.2-fpm
 
-### 5. Create Missing Components
+# Check Redis TimeSeries
+redis-cli MODULE LIST
 
-Create `components/header.php`:
+# Check metrics collector
+sudo systemctl status metrics-collector
+sudo journalctl -u metrics-collector -n 50
 
-```php
-<?php
-// components/header.php
-$current_user_ip = getCurrentUserIP();
-$system_health = (new RistService())->getSystemHealth();
-?>
-
-<header class="header">
-    <div class="header-content">
-        <div class="logo">🛰️ RIST Monitor</div>
-        <div class="status-indicators">
-            <div class="status-badge status-satellite">
-                <span>🛰️</span>
-                <span>System Active</span>
-            </div>
-            <div class="status-badge" style="background: rgba(55, 65, 81, 0.8);">
-                <span>💻</span>
-                <span>CPU: <?= $system_health['cpu_usage'] ?? '0' ?>%</span>
-            </div>
-            <div class="status-badge" style="background: rgba(55, 65, 81, 0.8);">
-                <span>📊</span>
-                <span><?= $system_health['running'] ?? 0 ?> Active</span>
-            </div>
-        </div>
-    </div>
-</header>
+# Verify data collection
+redis-cli KEYS "metrics:*"
 ```
+
+### 5. Metrics Pipeline Architecture
+
+The system uses a complete metrics pipeline for historical data:
+
+```
+┌─────────────┐     ┌──────────────┐     ┌───────────────┐     ┌──────────┐     ┌──────────┐
+│ ristsender  │────>│ Prometheus   │────>│ C Worker      │────>│  Redis   │────>│ Chart.js │
+│ (9101-910X) │     │ :metrics-port│     │ (5s polling)  │     │TimeSeries│     │ Frontend │
+└─────────────┘     └──────────────┘     └───────────────┘     └──────────┘     └──────────┘
+```
+
+**Components:**
+1. **ristsender**: Exposes Prometheus metrics on ports 9101+ (enabled with `-M --metrics-http --metrics-port=N`)
+2. **C Metrics Collector**: Multi-threaded worker that polls all transports every 5 seconds
+3. **Redis TimeSeries**: High-performance time-series database with 24-hour retention
+4. **PHP API**: Queries historical data from Redis for Chart.js frontend
+5. **Chart.js Frontend**: Interactive bandwidth graphs with multiple metrics and time ranges
+
+**Collected Metrics:**
+- Bandwidth (Mbps)
+- Quality (%)
+- RTT (ms)
+- Packet Loss (%)
+- Retry Bandwidth (Mbps)
+
+**Features:**
+- 📊 Interactive graphs with zoom and pan
+- ⏱️ Time ranges: 5m, 15m, 30m, 1h, 6h, 12h, 24h
+- 📈 Real-time stats: Current, Average, Max, Min
+- 🔄 Auto-refresh every 10 seconds
+- 🎯 Per-receiver historical tracking
 
 ## 🎯 Key Features Implemented
 
 ### ✅ Complete Features
 1. **Multi-Transport Support** - Dynamic tabs for multiple RIST senders
-2. **Transport Management** - Create, start, stop, restart RIST processes
-3. **Real-time Status** - Live monitoring of transport health
+2. **Transport Management** - Create, start, stop, restart RIST processes (systemd-based)
+3. **Real-time Status** - Live monitoring of transport health (5-second updates)
 4. **Receiver List** - Scalable list supporting thousands of receivers
 5. **Search & Filter** - Advanced filtering by status, location, Box ID
 6. **Advanced Configuration** - RIST profiles, encryption, buffer settings
 7. **System Health** - CPU, memory, disk usage monitoring
-8. **Responsive Design** - Works on desktop and mobile
+8. **Historical Metrics** - 24-hour bandwidth and quality graphs with Chart.js
+9. **High-Performance Collector** - Multi-threaded C worker for metrics collection
+10. **Responsive Design** - Works on desktop and mobile
 
 ### 🔧 Configuration Management
 - **Transport Parameters**: Input/Output URLs, buffer sizes, encryption
