@@ -3,13 +3,15 @@
 class Dashboard {
     constructor() {
         this.currentTransport = null;
+        this.currentTransportData = null;
+        this.currentMetrics = null;
         this.selectedReceiver = null;
         this.updateInterval = null;
         this.receivers = [];
         this.filteredReceivers = [];
         this.currentFilter = 'all';
         this.searchTerm = '';
-        
+
         this.initializeEventListeners();
     }
     
@@ -60,6 +62,14 @@ class Dashboard {
 
             const response = await ApiClient.get(`/transports/${transportId}`);
             this.currentTransport = transportId;
+            this.currentTransportData = response.data;
+
+            // Load metrics if transport is running
+            if (response.data.runtime_status?.status === 'running') {
+                await this.loadMetrics(transportId);
+            } else {
+                this.currentMetrics = null;
+            }
 
             this.updateTransportStatus(response.data);
             this.loadReceivers(transportId);
@@ -69,14 +79,31 @@ class Dashboard {
             this.showError('Failed to load transport data');
         }
     }
+
+    async loadMetrics(transportId) {
+        try {
+            const response = await ApiClient.get(`/transports/${transportId}/metrics`);
+            this.currentMetrics = response.data;
+        } catch (error) {
+            console.debug('Failed to load metrics:', error);
+            this.currentMetrics = null;
+        }
+    }
     
     updateTransportStatus(transport) {
         const statusContainer = document.getElementById('transport-status');
         if (!statusContainer) return;
-        
+
         const satellite = this.getSatelliteInfo(transport.satellite);
         const status = transport.runtime_status || {};
-        
+
+        // Get satellite peer metrics if available
+        const satellitePeer = this.currentMetrics?.satellite_peer;
+        const bandwidth = satellitePeer?.bandwidth_mbps || satellite.bitrate || '0.0';
+        const quality = satellitePeer?.quality || 0;
+        const rtt = satellitePeer?.rtt_ms || '-';
+        const packetLoss = satellitePeer ? this.calculatePacketLoss(satellitePeer) : '0.0';
+
         statusContainer.innerHTML = `
             <span class="satellite-icon pulse">&#128752;</span>
             <div class="satellite-name">${satellite.name}</div>
@@ -84,20 +111,20 @@ class Dashboard {
 
             <div class="satellite-details">
                 <div class="satellite-metric">
-                    <div class="satellite-metric-value">${satellite.frequency || '11,450'}</div>
-                    <div class="satellite-metric-label">Frequency (MHz)</div>
+                    <div class="satellite-metric-value">${bandwidth}</div>
+                    <div class="satellite-metric-label">Bandwidth (Mbps)</div>
                 </div>
                 <div class="satellite-metric">
-                    <div class="satellite-metric-value">${satellite.symbol_rate || '27,500'}</div>
-                    <div class="satellite-metric-label">Symbol Rate (KBaud)</div>
+                    <div class="satellite-metric-value">${quality}%</div>
+                    <div class="satellite-metric-label">Quality</div>
                 </div>
                 <div class="satellite-metric">
-                    <div class="satellite-metric-value">${satellite.bitrate || '60.0'}</div>
-                    <div class="satellite-metric-label">Total Bitrate (Mbps)</div>
+                    <div class="satellite-metric-value">${rtt}</div>
+                    <div class="satellite-metric-label">RTT (ms)</div>
                 </div>
                 <div class="satellite-metric">
-                    <div class="satellite-metric-value status-indicator status-${this.getStatusClass(status.status)}">${this.getStatusText(status.status)}</div>
-                    <div class="satellite-metric-label">Status</div>
+                    <div class="satellite-metric-value">${packetLoss}%</div>
+                    <div class="satellite-metric-label">Packet Loss</div>
                 </div>
             </div>
 
@@ -105,9 +132,23 @@ class Dashboard {
                 ${this.getControlButtons(transport.id, status.status)}
             </div>
         `;
-        
-        // Update status class
-        statusContainer.className = `satellite-overview ${this.getStatusClass(status.status)}`;
+
+        // Update status class based on quality
+        let statusClass = this.getStatusClass(status.status);
+        if (status.status === 'running' && quality > 0) {
+            if (quality >= 95) statusClass = 'active';
+            else if (quality >= 70) statusClass = 'warning';
+            else statusClass = 'error';
+        }
+        statusContainer.className = `satellite-overview ${statusClass}`;
+    }
+
+    calculatePacketLoss(peer) {
+        const sent = peer.sent_packets || 0;
+        const retransmitted = peer.retransmitted_packets || 0;
+
+        if (sent === 0) return '0.0';
+        return ((retransmitted / sent) * 100).toFixed(2);
     }
     
     getControlButtons(transportId, status) {
@@ -152,8 +193,14 @@ class Dashboard {
         try {
             showLoading('receivers-content');
 
-            const response = await ApiClient.get(`/transports/${transportId}/receivers`);
-            this.receivers = response.data || [];
+            // Use metrics data for receivers if available
+            if (this.currentMetrics && this.currentMetrics.receivers) {
+                this.receivers = this.convertMetricsToReceivers(this.currentMetrics.receivers);
+            } else {
+                // Fallback to receivers.json
+                const response = await ApiClient.get(`/transports/${transportId}/receivers`);
+                this.receivers = response.data || [];
+            }
 
             this.filterReceivers();
             this.updateReceiverCounts();
@@ -168,6 +215,34 @@ class Dashboard {
             document.getElementById('receivers-content').innerHTML =
                 '<div class="loading">Failed to load receivers</div>';
         }
+    }
+
+    convertMetricsToReceivers(metricsReceivers) {
+        return metricsReceivers.map(peer => {
+            // Determine status based on quality
+            let status = 'online';
+            if (peer.quality < 70) {
+                status = 'offline';
+            } else if (peer.quality < 95) {
+                status = 'fsr'; // Forward Error Correction
+            }
+
+            return {
+                box_id: peer.cname || `peer_${peer.peer_id}`,
+                transport_id: this.currentTransport,
+                location: peer.peer_url,
+                ip_address: peer.peer_url.split(':')[0],
+                status: status,
+                bandwidth: peer.bandwidth_mbps,
+                rtt: `${peer.rtt_ms} ms`,
+                packet_loss: this.calculatePacketLoss(peer),
+                quality: peer.quality,
+                last_seen: new Date().toISOString(),
+                gps_coordinates: null,
+                // Include raw peer data
+                _peer_data: peer
+            };
+        });
     }
     
     filterReceivers() {
@@ -372,9 +447,15 @@ class Dashboard {
     
     startRealTimeUpdates() {
         // Update every 30 seconds (reduced from 5 to prevent rate limiting)
-        // Only update receivers, not the entire transport
-        this.updateInterval = setInterval(() => {
-            if (this.currentTransport) {
+        this.updateInterval = setInterval(async () => {
+            if (this.currentTransport && this.currentTransportData) {
+                // Reload metrics if transport is running
+                if (this.currentTransportData.runtime_status?.status === 'running') {
+                    await this.loadMetrics(this.currentTransport);
+                    // Update the display with new metrics
+                    this.updateTransportStatus(this.currentTransportData);
+                }
+                // Reload receivers with fresh metrics
                 this.loadReceivers(this.currentTransport);
             }
         }, 30000);

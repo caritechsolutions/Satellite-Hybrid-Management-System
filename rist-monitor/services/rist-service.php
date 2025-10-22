@@ -337,18 +337,21 @@ class RistService {
             return ['error' => 'Failed to fetch metrics from ristsender'];
         }
 
-        // Parse Prometheus metrics format
-        $parsedMetrics = $this->parsePrometheusMetrics($metricsText);
+        // Parse Prometheus metrics format and classify peers
+        $parsedMetrics = $this->parsePrometheusMetrics($metricsText, $transport);
 
         return $parsedMetrics;
     }
 
-    private function parsePrometheusMetrics($metricsText) {
+    private function parsePrometheusMetrics($metricsText, $transport) {
         $lines = explode("\n", $metricsText);
         $metrics = [
-            'peers' => [],
+            'satellite_peer' => null,
+            'receivers' => [],
             'summary' => []
         ];
+
+        $peers = [];
 
         foreach ($lines as $line) {
             $line = trim($line);
@@ -376,8 +379,8 @@ class RistService {
                 if (isset($labels['peer_id'])) {
                     $peerId = $labels['peer_id'];
 
-                    if (!isset($metrics['peers'][$peerId])) {
-                        $metrics['peers'][$peerId] = [
+                    if (!isset($peers[$peerId])) {
+                        $peers[$peerId] = [
                             'peer_id' => $peerId,
                             'peer_url' => $labels['peer_url'] ?? 'unknown',
                             'listening' => $labels['listening'] ?? 'unknown',
@@ -389,51 +392,70 @@ class RistService {
                     // Map metric names to friendly names
                     switch ($metricName) {
                         case 'rist_sender_peer_bandwidth_bps':
-                            $metrics['peers'][$peerId]['bandwidth_bps'] = $value;
-                            $metrics['peers'][$peerId]['bandwidth_mbps'] = round($value / 1000000, 2);
+                            $peers[$peerId]['bandwidth_bps'] = $value;
+                            $peers[$peerId]['bandwidth_mbps'] = round($value / 1000000, 2);
                             break;
                         case 'rist_sender_peer_retry_bandwidth_bps':
-                            $metrics['peers'][$peerId]['retry_bandwidth_bps'] = $value;
+                            $peers[$peerId]['retry_bandwidth_bps'] = $value;
+                            $peers[$peerId]['retry_bandwidth_mbps'] = round($value / 1000000, 2);
                             break;
                         case 'rist_sender_peer_sent_packets':
-                            $metrics['peers'][$peerId]['sent_packets'] = $value;
+                            $peers[$peerId]['sent_packets'] = $value;
                             break;
                         case 'rist_sender_peer_retransmitted_packets':
-                            $metrics['peers'][$peerId]['retransmitted_packets'] = $value;
+                            $peers[$peerId]['retransmitted_packets'] = $value;
                             break;
                         case 'rist_sender_peer_received_packets':
-                            $metrics['peers'][$peerId]['received_packets'] = $value;
+                            $peers[$peerId]['received_packets'] = $value;
                             break;
                         case 'rist_sender_peer_rtt_seconds':
-                            $metrics['peers'][$peerId]['rtt_seconds'] = $value;
-                            $metrics['peers'][$peerId]['rtt_ms'] = round($value * 1000, 2);
+                            $peers[$peerId]['rtt_seconds'] = $value;
+                            $peers[$peerId]['rtt_ms'] = round($value * 1000, 2);
                             break;
                         case 'rist_sender_peer_quality':
-                            $metrics['peers'][$peerId]['quality'] = $value;
+                            $peers[$peerId]['quality'] = $value;
                             break;
                     }
                 }
             }
         }
 
-        // Convert peers array to indexed array
-        $metrics['peers'] = array_values($metrics['peers']);
+        // Classify peers by matching listening address with transport output URLs
+        foreach ($peers as $peer) {
+            $peerType = $this->identifyPeerType($peer['listening'], $transport['output_urls']);
+
+            if ($peerType === 'satellite') {
+                // This is the satellite peer (weight=0)
+                $metrics['satellite_peer'] = $peer;
+            } else {
+                // This is a receiver peer (weight=1000)
+                $peer['type'] = 'receiver';
+                $metrics['receivers'][] = $peer;
+            }
+        }
 
         // Calculate summary
-        if (!empty($metrics['peers'])) {
+        $allPeers = array_merge(
+            $metrics['satellite_peer'] ? [$metrics['satellite_peer']] : [],
+            $metrics['receivers']
+        );
+
+        if (!empty($allPeers)) {
             $totalBandwidth = 0;
             $avgQuality = 0;
             $avgRtt = 0;
 
-            foreach ($metrics['peers'] as $peer) {
+            foreach ($allPeers as $peer) {
                 $totalBandwidth += $peer['bandwidth_bps'] ?? 0;
                 $avgQuality += $peer['quality'] ?? 0;
                 $avgRtt += $peer['rtt_ms'] ?? 0;
             }
 
-            $peerCount = count($metrics['peers']);
+            $peerCount = count($allPeers);
             $metrics['summary'] = [
                 'total_peers' => $peerCount,
+                'total_receivers' => count($metrics['receivers']),
+                'has_satellite' => $metrics['satellite_peer'] !== null,
                 'total_bandwidth_mbps' => round($totalBandwidth / 1000000, 2),
                 'avg_quality' => round($avgQuality / $peerCount, 2),
                 'avg_rtt_ms' => round($avgRtt / $peerCount, 2)
@@ -441,6 +463,30 @@ class RistService {
         }
 
         return $metrics;
+    }
+
+    private function identifyPeerType($listeningAddress, $outputUrls) {
+        // Parse listening address (e.g., "192.168.110.107:5554")
+        foreach ($outputUrls as $url) {
+            // Parse output URL to extract host:port and weight
+            // Example: rist://@192.168.110.107:5554?weight=0&buffer=10000
+            if (preg_match('/rist:\/\/@?([\d\.]+:\d+).*weight=(\d+)/', $url, $matches)) {
+                $urlAddress = $matches[1];
+                $weight = $matches[2];
+
+                // Match listening address with URL address
+                if ($listeningAddress === $urlAddress) {
+                    if ($weight === '0') {
+                        return 'satellite';
+                    } else {
+                        return 'receiver';
+                    }
+                }
+            }
+        }
+
+        // Default to receiver if we can't determine
+        return 'receiver';
     }
     
     // Private Methods
