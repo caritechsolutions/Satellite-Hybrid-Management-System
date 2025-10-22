@@ -327,7 +327,7 @@ class ApiError extends Error {
 
 // Rate limiting helper
 class RateLimiter {
-    constructor(maxRequests = 10, timeWindow = 60000) { // 10 requests per minute
+    constructor(maxRequests = 100, timeWindow = 60000) { // 100 requests per minute
         this.maxRequests = maxRequests;
         this.timeWindow = timeWindow;
         this.requests = [];

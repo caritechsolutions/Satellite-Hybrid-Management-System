@@ -58,6 +58,16 @@ class RistService {
             }
         }
         
+        // Assign a unique metrics port (9101, 9102, 9103, etc.)
+        $transports = $this->getTransports();
+        $metricsPort = 9101;
+        if (!empty($transports)) {
+            $usedPorts = array_map(function($t) {
+                return $t['metrics_port'] ?? 9101;
+            }, $transports);
+            $metricsPort = max($usedPorts) + 1;
+        }
+
         // Create transport record
         $transport = [
             'id' => $id,
@@ -65,6 +75,7 @@ class RistService {
             'satellite' => sanitizeInput($data['satellite']),
             'input_url' => $data['input_url'],
             'output_urls' => $data['output_urls'],
+            'metrics_port' => $metricsPort,
             'status' => 'stopped',
             'pid' => null,
             'created_at' => date('c'),
@@ -76,9 +87,8 @@ class RistService {
                 'uptime_seconds' => 0
             ]
         ];
-        
+
         // Save to file
-        $transports = $this->getTransports();
         $transports[] = $transport;
         $this->saveTransports($transports);
         
@@ -304,34 +314,132 @@ class RistService {
     // Metrics and Monitoring
     public function getPrometheusMetrics($transport_id = null) {
         $transport = $transport_id ? $this->getTransport($transport_id) : null;
-        
-        if (!$transport || $transport['status'] !== 'running') {
+
+        if (!$transport) {
             return null;
         }
-        
-        // Query Prometheus for metrics
-        $metrics_url = PROMETHEUS_ENDPOINT . '/api/v1/query';
-        
-        $queries = [
-            'packets_sent' => 'rist_packets_sent_total{instance="' . $transport_id . '"}',
-            'packets_lost' => 'rist_packets_lost_total{instance="' . $transport_id . '"}',
-            'bandwidth' => 'rist_bandwidth_mbps{instance="' . $transport_id . '"}',
-            'rtt' => 'rist_rtt_ms{instance="' . $transport_id . '"}'
+
+        // Check if transport is running
+        if ($transport['status'] !== 'running') {
+            return ['error' => 'Transport is not running'];
+        }
+
+        // Get the metrics port for this transport
+        $metricsPort = $transport['metrics_port'] ?? 9101;
+
+        // Fetch metrics from ristsender's Prometheus endpoint
+        // Assuming ristsender is running on localhost
+        $metricsUrl = "http://127.0.0.1:{$metricsPort}/metrics";
+
+        $metricsText = $this->httpGet($metricsUrl);
+
+        if (!$metricsText) {
+            return ['error' => 'Failed to fetch metrics from ristsender'];
+        }
+
+        // Parse Prometheus metrics format
+        $parsedMetrics = $this->parsePrometheusMetrics($metricsText);
+
+        return $parsedMetrics;
+    }
+
+    private function parsePrometheusMetrics($metricsText) {
+        $lines = explode("\n", $metricsText);
+        $metrics = [
+            'peers' => [],
+            'summary' => []
         ];
-        
-        $metrics = [];
-        foreach ($queries as $metric => $query) {
-            $url = $metrics_url . '?' . http_build_query(['query' => $query]);
-            $response = $this->httpGet($url);
-            
-            if ($response) {
-                $data = json_decode($response, true);
-                if (isset($data['data']['result'][0]['value'][1])) {
-                    $metrics[$metric] = $data['data']['result'][0]['value'][1];
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+
+            // Skip comments and empty lines
+            if (empty($line) || strpos($line, '#') === 0) {
+                continue;
+            }
+
+            // Parse metric line: metric_name{labels} value
+            if (preg_match('/^([a-z_]+)\{([^}]+)\}\s+([0-9.e+-]+)/', $line, $matches)) {
+                $metricName = $matches[1];
+                $labelsStr = $matches[2];
+                $value = floatval($matches[3]);
+
+                // Parse labels
+                $labels = [];
+                if (preg_match_all('/([a-z_]+)="([^"]*)"/', $labelsStr, $labelMatches, PREG_SET_ORDER)) {
+                    foreach ($labelMatches as $labelMatch) {
+                        $labels[$labelMatch[1]] = $labelMatch[2];
+                    }
+                }
+
+                // Organize by peer
+                if (isset($labels['peer_id'])) {
+                    $peerId = $labels['peer_id'];
+
+                    if (!isset($metrics['peers'][$peerId])) {
+                        $metrics['peers'][$peerId] = [
+                            'peer_id' => $peerId,
+                            'peer_url' => $labels['peer_url'] ?? 'unknown',
+                            'listening' => $labels['listening'] ?? 'unknown',
+                            'cname' => $labels['cname'] ?? 'unknown',
+                            'sender_id' => $labels['sender_id'] ?? '0'
+                        ];
+                    }
+
+                    // Map metric names to friendly names
+                    switch ($metricName) {
+                        case 'rist_sender_peer_bandwidth_bps':
+                            $metrics['peers'][$peerId]['bandwidth_bps'] = $value;
+                            $metrics['peers'][$peerId]['bandwidth_mbps'] = round($value / 1000000, 2);
+                            break;
+                        case 'rist_sender_peer_retry_bandwidth_bps':
+                            $metrics['peers'][$peerId]['retry_bandwidth_bps'] = $value;
+                            break;
+                        case 'rist_sender_peer_sent_packets':
+                            $metrics['peers'][$peerId]['sent_packets'] = $value;
+                            break;
+                        case 'rist_sender_peer_retransmitted_packets':
+                            $metrics['peers'][$peerId]['retransmitted_packets'] = $value;
+                            break;
+                        case 'rist_sender_peer_received_packets':
+                            $metrics['peers'][$peerId]['received_packets'] = $value;
+                            break;
+                        case 'rist_sender_peer_rtt_seconds':
+                            $metrics['peers'][$peerId]['rtt_seconds'] = $value;
+                            $metrics['peers'][$peerId]['rtt_ms'] = round($value * 1000, 2);
+                            break;
+                        case 'rist_sender_peer_quality':
+                            $metrics['peers'][$peerId]['quality'] = $value;
+                            break;
+                    }
                 }
             }
         }
-        
+
+        // Convert peers array to indexed array
+        $metrics['peers'] = array_values($metrics['peers']);
+
+        // Calculate summary
+        if (!empty($metrics['peers'])) {
+            $totalBandwidth = 0;
+            $avgQuality = 0;
+            $avgRtt = 0;
+
+            foreach ($metrics['peers'] as $peer) {
+                $totalBandwidth += $peer['bandwidth_bps'] ?? 0;
+                $avgQuality += $peer['quality'] ?? 0;
+                $avgRtt += $peer['rtt_ms'] ?? 0;
+            }
+
+            $peerCount = count($metrics['peers']);
+            $metrics['summary'] = [
+                'total_peers' => $peerCount,
+                'total_bandwidth_mbps' => round($totalBandwidth / 1000000, 2),
+                'avg_quality' => round($avgQuality / $peerCount, 2),
+                'avg_rtt_ms' => round($avgRtt / $peerCount, 2)
+            ];
+        }
+
         return $metrics;
     }
     
@@ -598,6 +706,12 @@ EOD;
 
         // Set verbosity to 3 (reduced from default)
         $cmd .= ' -v 3';
+
+        // Get metrics port for this transport (default 9101, increment for each transport)
+        $metricsPort = $transport['metrics_port'] ?? 9101;
+
+        // Add Prometheus metrics endpoint
+        $cmd .= ' -M --metrics-http --metrics-port=' . $metricsPort;
 
         return $cmd;
     }
