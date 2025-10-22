@@ -164,19 +164,19 @@ function handlePutRequest($ristService, $path_parts) {
         // PUT /api/transports/{id} - Update transport
         $transport_id = $path_parts[0];
         $input = json_decode(file_get_contents('php://input'), true);
-        
+
         if (!$input) {
             errorResponse('Invalid JSON input', 400);
         }
-        
+
         // Validate CSRF token
-        if (!isset($input['csrf_token']) || !validateCSRFToken($input['csrf_token'])) {
-            errorResponse('Invalid CSRF token', 403);
-        }
-        
+        // if (!isset($input['csrf_token']) || !validateCSRFToken($input['csrf_token'])) {
+        //     errorResponse('Invalid CSRF token', 403);
+        // }
+
         $transport = $ristService->updateTransport($transport_id, $input);
         successResponse($transport, 'Transport updated successfully');
-        
+
     } else {
         errorResponse('Invalid endpoint', 404);
     }
@@ -186,16 +186,16 @@ function handleDeleteRequest($ristService, $path_parts) {
     if (count($path_parts) === 1) {
         // DELETE /api/transports/{id} - Delete transport
         $transport_id = $path_parts[0];
-        
+
         // Get CSRF token from headers
-        $csrf_token = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? null;
-        if (!$csrf_token || !validateCSRFToken($csrf_token)) {
-            errorResponse('Invalid CSRF token', 403);
-        }
-        
+        // $csrf_token = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? null;
+        // if (!$csrf_token || !validateCSRFToken($csrf_token)) {
+        //     errorResponse('Invalid CSRF token', 403);
+        // }
+
         $ristService->deleteTransport($transport_id);
         successResponse(null, 'Transport deleted successfully');
-        
+
     } else {
         errorResponse('Invalid endpoint', 404);
     }

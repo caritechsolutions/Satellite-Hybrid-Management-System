@@ -99,7 +99,7 @@ class RistService {
     public function updateTransport($id, $data) {
         $transports = $this->getTransports();
         $found = false;
-        
+
         foreach ($transports as &$transport) {
             if ($transport['id'] === $id) {
                 // Update allowed fields
@@ -119,16 +119,27 @@ class RistService {
                         $transport[$field] = $data[$field];
                     }
                 }
+
+                // Ensure transport has a metrics_port (for older transports)
+                if (!isset($transport['metrics_port'])) {
+                    // Find the highest used port
+                    $usedPorts = array_map(function($t) {
+                        return $t['metrics_port'] ?? 9101;
+                    }, $transports);
+                    $transport['metrics_port'] = max($usedPorts) + 1;
+                    logMessage('INFO', "Assigned metrics_port {$transport['metrics_port']} to transport: {$id}");
+                }
+
                 $transport['updated_at'] = date('c');
                 $found = true;
                 break;
             }
         }
-        
+
         if (!$found) {
             throw new Exception("Transport not found: {$id}");
         }
-        
+
         $this->saveTransports($transports);
         logMessage('INFO', "Updated transport: {$id}");
         return $this->getTransport($id);
