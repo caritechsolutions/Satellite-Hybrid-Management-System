@@ -143,45 +143,47 @@ class RistService {
         if (!$transport) {
             throw new Exception("Transport not found: {$id}");
         }
-        
-        if ($transport['status'] === 'running') {
-            throw new Exception("Transport is already running: {$id}");
+
+        // Check if service is already running
+        $serviceStatus = $this->getServiceStatus($id);
+        if ($serviceStatus === 'active') {
+            $this->updateTransportStatus($id, 'running', null);
+            throw new Exception("Transport service is already running: {$id}");
         }
-        
-        // Build RIST sender command
-        $cmd = $this->buildRistCommand($transport);
-        
-        // Start the process
-        logMessage('INFO', "Starting transport: {$id}", ['command' => $cmd]);
-        
-        // Execute command in background and capture PID
-        $descriptorspec = [
-            0 => ['pipe', 'r'], // stdin
-            1 => ['pipe', 'w'], // stdout  
-            2 => ['pipe', 'w']  // stderr
-        ];
-        
-        $process = proc_open($cmd . ' & echo $!', $descriptorspec, $pipes);
-        
-        if (is_resource($process)) {
-            $pid = trim(fgets($pipes[1]));
-            
-            // Close pipes
-            fclose($pipes[0]);
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-            proc_close($process);
-            
-            if (is_numeric($pid)) {
-                // Update transport status
-                $this->updateTransportStatus($id, 'running', $pid);
-                logMessage('INFO', "Started transport: {$id} with PID: {$pid}");
-                return true;
-            } else {
-                throw new Exception("Failed to start transport: {$id}");
-            }
+
+        // Generate systemd service file
+        $serviceFile = $this->generateSystemdServiceFile($transport);
+
+        // Install the service file
+        $serviceName = "rist-transport-{$id}.service";
+        $serviceDestination = "/etc/systemd/system/{$serviceName}";
+
+        // Copy service file to systemd directory (requires sudo)
+        $installCmd = "sudo cp " . escapeshellarg($serviceFile) . " " . escapeshellarg($serviceDestination);
+        exec($installCmd, $output, $return_code);
+
+        if ($return_code !== 0) {
+            throw new Exception("Failed to install service file for transport: {$id}");
+        }
+
+        // Reload systemd daemon
+        exec("sudo systemctl daemon-reload", $output, $return_code);
+
+        // Enable the service (auto-start on reboot)
+        exec("sudo systemctl enable {$serviceName}", $output, $return_code);
+
+        // Start the service
+        exec("sudo systemctl start {$serviceName} 2>&1", $output, $return_code);
+
+        if ($return_code === 0) {
+            // Update transport status
+            $this->updateTransportStatus($id, 'running', null);
+            logMessage('INFO', "Started transport service: {$id}");
+            return true;
         } else {
-            throw new Exception("Failed to execute command for transport: {$id}");
+            $errorMsg = implode("\n", $output);
+            logMessage('ERROR', "Failed to start transport service: {$id}", ['error' => $errorMsg]);
+            throw new Exception("Failed to start transport service: {$id}. Error: {$errorMsg}");
         }
     }
     
@@ -190,30 +192,27 @@ class RistService {
         if (!$transport) {
             throw new Exception("Transport not found: {$id}");
         }
-        
-        if ($transport['status'] !== 'running' || !$transport['pid']) {
-            $this->updateTransportStatus($id, 'stopped', null);
-            return true;
+
+        $serviceName = "rist-transport-{$id}.service";
+
+        // Stop the service
+        exec("sudo systemctl stop {$serviceName} 2>&1", $output, $return_code);
+
+        // Disable the service (prevent auto-start on reboot)
+        exec("sudo systemctl disable {$serviceName} 2>&1", $output2, $return_code2);
+
+        // Update transport status regardless of command result
+        $this->updateTransportStatus($id, 'stopped', null);
+
+        // Remove the service file
+        $serviceDestination = "/etc/systemd/system/{$serviceName}";
+        if (file_exists($serviceDestination)) {
+            exec("sudo rm " . escapeshellarg($serviceDestination), $output3, $return_code3);
+            exec("sudo systemctl daemon-reload", $output4, $return_code4);
         }
-        
-        // Kill the process
-        $pid = $transport['pid'];
-        $kill_cmd = "kill {$pid}";
-        
-        exec($kill_cmd, $output, $return_code);
-        
-        if ($return_code === 0) {
-            $this->updateTransportStatus($id, 'stopped', null);
-            logMessage('INFO', "Stopped transport: {$id} (PID: {$pid})");
-            return true;
-        } else {
-            // Force kill if normal kill failed
-            $force_kill_cmd = "kill -9 {$pid}";
-            exec($force_kill_cmd, $output, $return_code);
-            $this->updateTransportStatus($id, 'stopped', null);
-            logMessage('WARNING', "Force killed transport: {$id} (PID: {$pid})");
-            return true;
-        }
+
+        logMessage('INFO', "Stopped and disabled transport service: {$id}");
+        return true;
     }
     
     public function restartTransport($id) {
@@ -227,26 +226,28 @@ class RistService {
         if (!$transport) {
             return null;
         }
-        
-        // Check if process is actually running
-        if ($transport['status'] === 'running' && $transport['pid']) {
-            $pid = $transport['pid'];
-            $check_cmd = "ps -p {$pid}";
-            exec($check_cmd, $output, $return_code);
-            
-            if ($return_code !== 0) {
-                // Process is not running, update status
+
+        // Check systemd service status
+        $serviceStatus = $this->getServiceStatus($id);
+
+        // Update transport status based on service status
+        if ($serviceStatus === 'active') {
+            if ($transport['status'] !== 'running') {
+                $this->updateTransportStatus($id, 'running', null);
+                $transport['status'] = 'running';
+            }
+        } else {
+            if ($transport['status'] !== 'stopped') {
                 $this->updateTransportStatus($id, 'stopped', null);
                 $transport['status'] = 'stopped';
-                $transport['pid'] = null;
             }
         }
-        
+
         return [
             'id' => $transport['id'],
             'name' => $transport['name'],
             'status' => $transport['status'],
-            'pid' => $transport['pid'],
+            'service_status' => $serviceStatus,
             'uptime' => $this->getTransportUptime($transport),
             'metrics' => $transport['metrics'] ?? []
         ];
@@ -521,15 +522,127 @@ class RistService {
         $base = 1024;
         $class = min((int)log($bytes , $base) , count($si_prefix) - 1);
         $free_space = sprintf('%1.2f' , $bytes / pow($base,$class)) . ' ' . $si_prefix[$class];
-        
+
         $total_bytes = disk_total_space(".");
         $used_bytes = $total_bytes - $bytes;
         $usage_percentage = ($used_bytes / $total_bytes) * 100;
-        
+
         return [
             'free_space' => $free_space,
             'usage_percentage' => round($usage_percentage, 2)
         ];
+    }
+
+    // Systemd Service Management
+    private function generateSystemdServiceFile($transport) {
+        // Build ristsender command
+        $senderCmd = $this->buildRistSenderCommand($transport);
+
+        // Build ristreceiver command
+        $receiverCmd = $this->buildRistReceiverCommand($transport);
+
+        // Create temporary directory for service files if it doesn't exist
+        $tmpDir = '/tmp/rist-services';
+        if (!file_exists($tmpDir)) {
+            mkdir($tmpDir, 0755, true);
+        }
+
+        $serviceFile = "{$tmpDir}/rist-transport-{$transport['id']}.service";
+
+        // Generate systemd service file content
+        $serviceContent = <<<EOD
+[Unit]
+Description=RIST Transport: {$transport['name']}
+After=network.target
+
+[Service]
+Type=forking
+Restart=always
+RestartSec=5
+
+# Start ristsender first
+ExecStartPre=/bin/bash -c '{$senderCmd} > /dev/null 2>&1 &'
+ExecStartPre=/bin/sleep 2
+
+# Start ristreceiver after ristsender is running
+ExecStart=/bin/bash -c '{$receiverCmd} > /dev/null 2>&1 &'
+
+# Stop commands
+ExecStop=/usr/bin/pkill -f "ristsender.*{$transport['id']}"
+ExecStop=/usr/bin/pkill -f "ristreceiver.*{$transport['id']}"
+
+[Install]
+WantedBy=multi-user.target
+EOD;
+
+        // Write service file
+        file_put_contents($serviceFile, $serviceContent);
+        chmod($serviceFile, 0644);
+
+        return $serviceFile;
+    }
+
+    private function buildRistSenderCommand($transport) {
+        $cmd = 'ristsender';
+
+        // Input URL
+        $cmd .= ' -i ' . escapeshellarg($transport['input_url']);
+
+        // Output URLs - join with comma
+        if (!empty($transport['output_urls'])) {
+            $outputUrls = array_map(function($url) {
+                return escapeshellarg($url);
+            }, $transport['output_urls']);
+            $cmd .= ' -o ' . implode(',', $outputUrls);
+        }
+
+        // Set verbosity to 3 (reduced from default)
+        $cmd .= ' -v 3';
+
+        return $cmd;
+    }
+
+    private function buildRistReceiverCommand($transport) {
+        // Use the first RIST output URL as the receiver input
+        if (empty($transport['output_urls'])) {
+            throw new Exception("No output URLs configured for transport: {$transport['id']}");
+        }
+
+        // Extract the first RIST URL
+        $ristUrl = $transport['output_urls'][0];
+
+        // Parse RIST URL to get host:port (remove parameters)
+        if (preg_match('/rist:\/\/@?([\d\.]+:\d+)/', $ristUrl, $matches)) {
+            $ristInput = 'rist://' . $matches[1];
+        } else {
+            throw new Exception("Invalid RIST URL format: {$ristUrl}");
+        }
+
+        // Build receiver command
+        $cmd = '/root/part7rist/ristreceiver_with_markers';
+        $cmd .= ' -i ' . escapeshellarg($ristInput);
+
+        // Output to multicast (example: udp://239.6.6.6:6000)
+        // For now, use a default - this should be configurable in the transport settings
+        $receiverOutput = 'udp://239.6.6.6:6000';
+        $cmd .= ' -o ' . escapeshellarg($receiverOutput);
+
+        // Set verbosity to 3 (reduced from -v 6)
+        $cmd .= ' -v 3';
+
+        return $cmd;
+    }
+
+    private function getServiceStatus($id) {
+        $serviceName = "rist-transport-{$id}.service";
+
+        // Check if service is active
+        exec("systemctl is-active {$serviceName} 2>&1", $output, $return_code);
+
+        $status = trim(implode('', $output));
+
+        // Return 'active', 'inactive', 'failed', etc.
+        return $status;
     }
 }
 ?>
