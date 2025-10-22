@@ -1,0 +1,31 @@
+[Unit]
+Description=RIST Metrics Collector
+Documentation=https://github.com/caritechsolutions/Satellite-Hybrid-Management-System
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/rist-monitor/worker
+ExecStart=/usr/local/bin/metrics-collector
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=metrics-collector
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Performance
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target
