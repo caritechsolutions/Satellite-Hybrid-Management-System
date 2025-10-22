@@ -1,6 +1,7 @@
 <?php
 // satellites.php - Satellite Management Page
 require_once 'config/config.php';
+require_once 'services/rist-service.php';
 
 // Simple satellite management (reads from config/satellites.json)
 $satellitesFile = __DIR__ . '/config/satellites.json';

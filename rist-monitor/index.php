@@ -15,6 +15,10 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
     <title>RIST Monitor</title>
     <link rel="stylesheet" href="assets/css/main.css">
     <link rel="stylesheet" href="assets/css/components.css">
+    <!-- Leaflet CSS for maps -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin=""/>
 </head>
 <body>
     <?php include 'components/header.php'; ?>
@@ -59,12 +63,21 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
             <!-- World Map -->
             <div class="card">
                 <h2 class="card-title">Global Receiver Distribution</h2>
-                <div class="map-container">
-                    <div class="map-placeholder">
-                        &#127760; Interactive World Map<br>
-                        <small style="opacity: 0.7;">Green: Satellite &bull; Yellow: FSR &bull; Red: Offline</small>
-                    </div>
+                <div class="map-legend">
+                    <span class="legend-item">
+                        <span class="legend-dot" style="background: #10b981;"></span>
+                        Satellite
+                    </span>
+                    <span class="legend-item">
+                        <span class="legend-dot" style="background: #f59e0b;"></span>
+                        FSR
+                    </span>
+                    <span class="legend-item">
+                        <span class="legend-dot" style="background: #ef4444;"></span>
+                        Offline
+                    </span>
                 </div>
+                <div id="receiver-map" class="map-container"></div>
             </div>
 
             <!-- Receivers List -->
@@ -143,10 +156,16 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
         </div>
     </div>
 
+    <!-- Leaflet JS for maps -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
+
     <script src="assets/js/api-client.js"></script>
     <script src="assets/js/transport-config.js"></script>
     <script src="assets/js/dashboard.js"></script>
     <script src="assets/js/real-time.js"></script>
+    <script src="assets/js/receiver-map.js"></script>
     
     <script>
         // Initialize dashboard with active transport

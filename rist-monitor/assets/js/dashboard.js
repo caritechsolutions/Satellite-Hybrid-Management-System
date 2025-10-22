@@ -151,16 +151,21 @@ class Dashboard {
     async loadReceivers(transportId) {
         try {
             showLoading('receivers-content');
-            
+
             const response = await ApiClient.get(`/transports/${transportId}/receivers`);
             this.receivers = response.data || [];
-            
+
             this.filterReceivers();
             this.updateReceiverCounts();
-            
+
+            // Update map with receivers
+            if (window.receiverMap) {
+                window.receiverMap.update(this.receivers);
+            }
+
         } catch (error) {
             console.error('Failed to load receivers:', error);
-            document.getElementById('receivers-content').innerHTML = 
+            document.getElementById('receivers-content').innerHTML =
                 '<div class="loading">Failed to load receivers</div>';
         }
     }
