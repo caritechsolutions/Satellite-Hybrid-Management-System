@@ -172,7 +172,7 @@ if (file_exists($satellitesFile)) {
 
         async function editSatellite(satelliteId) {
             try {
-                const response = await ApiClient.get(`/satellites/${satelliteId}`);
+                const response = await ApiClient.get(`/satellites.php?id=${satelliteId}`);
                 const satellite = response.data;
 
                 currentEditingSatelliteId = satelliteId;
