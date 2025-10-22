@@ -363,7 +363,10 @@ class Dashboard {
     updateReceiverDetail(receiver) {
         const detailContainer = document.querySelector('.receiver-detail');
         if (!detailContainer) return;
-        
+
+        // Show the detail card
+        detailContainer.style.display = 'block';
+
         detailContainer.innerHTML = `
             <div class="detail-header">
                 <div class="detail-title">${receiver.box_id} - ${receiver.location}</div>
@@ -396,11 +399,14 @@ class Dashboard {
                 <div class="detail-info-label">IP Address</div>
                 <div class="detail-info-value">${receiver.ip_address || 'Unknown'}</div>
             </div>
-            
-            <button class="btn btn-primary" style="width: 100%; margin-top: 1rem;" 
+
+            <button class="btn btn-primary" style="width: 100%; margin-top: 1rem;"
                     onclick="dashboard.showBandwidthGraph('${receiver.box_id}')">
-                ?? Show Bandwidth Graph
+                &#128200; Show Bandwidth Graph
             </button>
+            <div style="color: #9ca3af; font-size: 0.75rem; margin-top: 0.5rem; text-align: center;">
+                Historical data storage not yet implemented
+            </div>
         `;
     }
     
@@ -454,7 +460,7 @@ class Dashboard {
     }
     
     startRealTimeUpdates() {
-        // Update every 30 seconds (reduced from 5 to prevent rate limiting)
+        // Update every 5 seconds for real-time metrics
         this.updateInterval = setInterval(async () => {
             if (this.currentTransport && this.currentTransportData) {
                 // Reload metrics if transport is running
@@ -462,11 +468,20 @@ class Dashboard {
                     await this.loadMetrics(this.currentTransport);
                     // Update the display with new metrics
                     this.updateTransportStatus(this.currentTransportData);
+
+                    // Update detail card if a receiver is selected
+                    if (this.selectedReceiver) {
+                        const updatedReceiver = this.receivers.find(r => r.box_id === this.selectedReceiver.box_id);
+                        if (updatedReceiver) {
+                            this.selectedReceiver = updatedReceiver;
+                            this.updateReceiverDetail(updatedReceiver);
+                        }
+                    }
                 }
                 // Reload receivers with fresh metrics
                 this.loadReceivers(this.currentTransport);
             }
-        }, 30000);
+        }, 5000); // 5 seconds for real-time updates
     }
     
     stopRealTimeUpdates() {
