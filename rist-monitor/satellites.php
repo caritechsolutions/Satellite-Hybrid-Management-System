@@ -204,7 +204,7 @@ if (file_exists($satellitesFile)) {
             if (!confirmed) return;
 
             try {
-                await ApiClient.delete(`/satellites/${satelliteId}`);
+                await ApiClient.delete(`/satellites.php?id=${satelliteId}`);
                 alert('Satellite deleted successfully!');
                 location.reload();
             } catch (error) {
@@ -235,11 +235,11 @@ if (file_exists($satellitesFile)) {
                 if (currentEditingSatelliteId) {
                     // Update existing satellite
                     submitButton.textContent = 'Updating...';
-                    response = await ApiClient.put(`/satellites/${currentEditingSatelliteId}`, data);
+                    response = await ApiClient.put(`/satellites.php?id=${currentEditingSatelliteId}`, data);
                 } else {
                     // Create new satellite
                     submitButton.textContent = 'Creating...';
-                    response = await ApiClient.post('/satellites', data);
+                    response = await ApiClient.post('/satellites.php', data);
                 }
 
                 if (response.error) {
