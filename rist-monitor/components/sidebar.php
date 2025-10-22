@@ -304,13 +304,63 @@ function resetConfiguration() {
 
 // Auto-update system health
 function updateSystemHealth() {
-    ApiClient.get('/system/health')
+    ApiClient.get('/system-health.php')
         .then(response => {
             const data = response.data;
-            document.getElementById('cpu-usage').textContent = data.cpu_usage + '%';
-            document.getElementById('memory-usage').textContent = data.memory_usage + '%';
-            document.getElementById('disk-usage').textContent = data.disk_usage + '%';
-            document.getElementById('network-load').textContent = data.network_load || 'Normal';
+
+            // Update CPU Usage with color coding
+            const cpuElement = document.getElementById('cpu-usage');
+            if (cpuElement && data.cpu_usage !== undefined) {
+                cpuElement.textContent = data.cpu_usage + '%';
+
+                // Color code based on usage
+                if (data.cpu_usage > 80) {
+                    cpuElement.style.color = '#ef4444'; // Red
+                } else if (data.cpu_usage > 60) {
+                    cpuElement.style.color = '#f59e0b'; // Orange
+                } else {
+                    cpuElement.style.color = '#10b981'; // Green
+                }
+            }
+
+            // Update Memory Usage with color coding
+            const memoryElement = document.getElementById('memory-usage');
+            if (memoryElement && data.memory_usage !== undefined) {
+                memoryElement.textContent = data.memory_usage + '%';
+
+                // Color code based on usage
+                if (data.memory_usage > 80) {
+                    memoryElement.style.color = '#ef4444'; // Red
+                } else if (data.memory_usage > 60) {
+                    memoryElement.style.color = '#f59e0b'; // Orange
+                } else {
+                    memoryElement.style.color = '#10b981'; // Green
+                }
+            }
+
+            // Update Disk Usage
+            const diskElement = document.getElementById('disk-usage');
+            if (diskElement && data.disk_usage) {
+                if (data.disk_usage.usage_percentage !== undefined) {
+                    diskElement.textContent = data.disk_usage.usage_percentage + '%';
+
+                    // Color code based on usage
+                    if (data.disk_usage.usage_percentage > 90) {
+                        diskElement.style.color = '#ef4444'; // Red
+                    } else if (data.disk_usage.usage_percentage > 75) {
+                        diskElement.style.color = '#f59e0b'; // Orange
+                    } else {
+                        diskElement.style.color = '#10b981'; // Green
+                    }
+                }
+            }
+
+            // Network Load - set to normal for now
+            const networkElement = document.getElementById('network-load');
+            if (networkElement) {
+                networkElement.textContent = 'Normal';
+                networkElement.style.color = '#10b981';
+            }
         })
         .catch(error => {
             // Silently fail - API not implemented yet
@@ -362,10 +412,14 @@ document.addEventListener('DOMContentLoaded', function() {
         updateRecentEvents();
     }, 1000);
 
-    // Update every 60 seconds (reduced from 30 to prevent rate limiting)
+    // Update system health every 5 seconds for real-time monitoring
     setInterval(() => {
         updateSystemHealth();
+    }, 5000);
+
+    // Update events less frequently (every 30 seconds)
+    setInterval(() => {
         updateRecentEvents();
-    }, 60000);
+    }, 30000);
 });
 </script>
