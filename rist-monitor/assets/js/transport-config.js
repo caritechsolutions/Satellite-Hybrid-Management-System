@@ -70,7 +70,13 @@ class TransportConfig {
 
             this.currentEditingTransport = transportId;
 
-            // Populate form fields
+            // Show modal first
+            document.getElementById('add-transport-modal').classList.add('show');
+
+            // Load satellites and wait for them to populate
+            await window.loadSatellites();
+
+            // Now populate form fields (after satellites are loaded)
             document.getElementById('transport-name').value = transport.name;
             document.getElementById('satellite-select').value = transport.satellite;
             document.getElementById('input-url').value = transport.input_url;
@@ -92,10 +98,6 @@ class TransportConfig {
             // Update modal title and button
             document.querySelector('#add-transport-modal .modal-header h3').textContent = 'Edit Transport';
             document.querySelector('#add-transport-form button[type="submit"]').textContent = 'Update Transport';
-
-            // Show modal
-            document.getElementById('add-transport-modal').classList.add('show');
-            await window.loadSatellites();
 
         } catch (error) {
             console.error('Failed to load transport for editing:', error);

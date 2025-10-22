@@ -115,7 +115,7 @@
             <div class="config-section">
                 <div class="config-label">Generate Report</div>
                 <button class="btn btn-primary" style="width: 100%;" onclick="generateReport()">
-                    ?? Generate Full Report
+                    &#128196; Generate Full Report
                 </button>
             </div>
         </div>
@@ -313,7 +313,8 @@ function updateSystemHealth() {
             document.getElementById('network-load').textContent = data.network_load || 'Normal';
         })
         .catch(error => {
-            console.error('Failed to update system health:', error);
+            // Silently fail - API not implemented yet
+            console.debug('System health API not available');
         });
 }
 
@@ -323,21 +324,22 @@ function updateRecentEvents() {
         .then(response => {
             const events = response.data || [];
             const container = document.getElementById('recent-events');
-            
+
             if (events.length === 0) {
                 container.innerHTML = '<div>No recent events</div>';
                 return;
             }
-            
-            const eventsHTML = events.map(event => 
-                `<div style="margin-bottom: 0.5rem;">• ${event.message} (${formatTimeAgo(event.timestamp)})</div>`
+
+            const eventsHTML = events.map(event =>
+                `<div style="margin-bottom: 0.5rem;">&#8226; ${event.message} (${formatTimeAgo(event.timestamp)})</div>`
             ).join('');
-            
+
             container.innerHTML = eventsHTML;
         })
         .catch(error => {
-            console.error('Failed to update recent events:', error);
-            document.getElementById('recent-events').innerHTML = '<div>Failed to load events</div>';
+            // Silently fail - API not implemented yet
+            console.debug('System events API not available');
+            document.getElementById('recent-events').innerHTML = '<div>No events available</div>';
         });
 }
 
@@ -354,13 +356,16 @@ function formatTimeAgo(timestamp) {
 
 // Initialize sidebar updates
 document.addEventListener('DOMContentLoaded', function() {
-    updateSystemHealth();
-    updateRecentEvents();
-    
-    // Update every 30 seconds
+    // Initial load
+    setTimeout(() => {
+        updateSystemHealth();
+        updateRecentEvents();
+    }, 1000);
+
+    // Update every 60 seconds (reduced from 30 to prevent rate limiting)
     setInterval(() => {
         updateSystemHealth();
         updateRecentEvents();
-    }, 30000);
+    }, 60000);
 });
 </script>

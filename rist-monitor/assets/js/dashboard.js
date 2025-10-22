@@ -57,14 +57,13 @@ class Dashboard {
     async loadTransport(transportId) {
         try {
             showLoading('transport-status');
-            
+
             const response = await ApiClient.get(`/transports/${transportId}`);
             this.currentTransport = transportId;
-            
+
             this.updateTransportStatus(response.data);
             this.loadReceivers(transportId);
-            this.loadSatelliteInfo(response.data.satellite);
-            
+
         } catch (error) {
             console.error('Failed to load transport:', error);
             this.showError('Failed to load transport data');
@@ -79,10 +78,10 @@ class Dashboard {
         const status = transport.runtime_status || {};
         
         statusContainer.innerHTML = `
-            <span class="satellite-icon pulse">???</span>
+            <span class="satellite-icon pulse">&#128752;</span>
             <div class="satellite-name">${satellite.name}</div>
             <div style="color: #9ca3af; margin-bottom: 1rem;">${transport.name}</div>
-            
+
             <div class="satellite-details">
                 <div class="satellite-metric">
                     <div class="satellite-metric-value">${satellite.frequency || '11,450'}</div>
@@ -97,11 +96,11 @@ class Dashboard {
                     <div class="satellite-metric-label">Total Bitrate (Mbps)</div>
                 </div>
                 <div class="satellite-metric">
-                    <div class="satellite-metric-value">${this.getSignalQuality(status)}</div>
-                    <div class="satellite-metric-label">Signal Quality</div>
+                    <div class="satellite-metric-value status-indicator status-${this.getStatusClass(status.status)}">${this.getStatusText(status.status)}</div>
+                    <div class="satellite-metric-label">Status</div>
                 </div>
             </div>
-            
+
             <div class="control-buttons">
                 ${this.getControlButtons(transport.id, status.status)}
             </div>
@@ -139,16 +138,14 @@ class Dashboard {
         }
     }
     
-    getSignalQuality(status) {
-        if (status.status !== 'running') return 'Offline';
-        
-        const metrics = status.metrics || {};
-        const loss = parseFloat(metrics.packet_loss || 0);
-        
-        if (loss < 0.01) return 'Excellent';
-        if (loss < 0.1) return 'Good';
-        if (loss < 1) return 'Fair';
-        return 'Poor';
+    getStatusText(status) {
+        switch (status) {
+            case 'running': return 'Running';
+            case 'stopped': return 'Stopped';
+            case 'error': return 'Error';
+            case 'starting': return 'Starting';
+            default: return 'Unknown';
+        }
     }
     
     async loadReceivers(transportId) {
@@ -369,12 +366,13 @@ class Dashboard {
     }
     
     startRealTimeUpdates() {
-        // Update every 5 seconds
+        // Update every 30 seconds (reduced from 5 to prevent rate limiting)
+        // Only update receivers, not the entire transport
         this.updateInterval = setInterval(() => {
             if (this.currentTransport) {
-                this.loadTransport(this.currentTransport);
+                this.loadReceivers(this.currentTransport);
             }
-        }, 5000);
+        }, 30000);
     }
     
     stopRealTimeUpdates() {

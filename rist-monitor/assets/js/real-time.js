@@ -8,16 +8,26 @@ class RealTimeManager {
     constructor() {
         this.ws = null;
         this.pollingInterval = null;
-        this.pollingRate = 5000; // 5 seconds
+        this.pollingRate = 60000; // 60 seconds (reduced from 5 to prevent rate limiting)
         this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 5;
-        this.connectionMode = 'polling'; // 'websocket' or 'polling'
+        this.maxReconnectAttempts = 3; // Reduced from 5 attempts
+        this.connectionMode = 'disabled'; // Disabled by default, can be 'websocket' or 'polling'
     }
 
     /**
      * Initialize real-time updates
      */
     start() {
+        // Disabled by default to prevent excessive polling
+        // Can be enabled later when WebSocket server is implemented
+        console.log('Real-time manager: disabled (to enable, call realTimeManager.enable())');
+        this.connectionMode = 'disabled';
+    }
+
+    /**
+     * Enable real-time updates
+     */
+    enable() {
         // Try WebSocket first, fallback to polling
         if (this.supportsWebSocket()) {
             this.startWebSocket();

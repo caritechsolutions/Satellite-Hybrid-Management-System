@@ -61,8 +61,8 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
                 <h2 class="card-title">Global Receiver Distribution</h2>
                 <div class="map-container">
                     <div class="map-placeholder">
-                        🗺️ Interactive World Map<br>
-                        <small style="opacity: 0.7;">Green: Satellite • Yellow: FSR • Red: Offline</small>
+                        &#127760; Interactive World Map<br>
+                        <small style="opacity: 0.7;">Green: Satellite &bull; Yellow: FSR &bull; Red: Offline</small>
                     </div>
                 </div>
             </div>
