@@ -753,12 +753,12 @@ EOD;
         // Input URL
         $cmd .= ' -i ' . escapeshellarg($transport['input_url']);
 
-        // Output URLs - join with comma
+        // Output URLs - join with comma first, then escape the entire string
         if (!empty($transport['output_urls'])) {
-            $outputUrls = array_map(function($url) {
-                return escapeshellarg($url);
-            }, $transport['output_urls']);
-            $cmd .= ' -o ' . implode(',', $outputUrls);
+            // Join all URLs with comma (no spaces)
+            $outputUrlsString = implode(',', $transport['output_urls']);
+            // Escape the entire string as one argument
+            $cmd .= ' -o ' . escapeshellarg($outputUrlsString);
         }
 
         // Set verbosity to 3 (reduced from default)
