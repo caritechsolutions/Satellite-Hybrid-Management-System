@@ -310,55 +310,73 @@ int load_transports_from_json() {
     // Simple JSON parsing (looking for running transports)
     int count = 0;
     char *ptr = json;
+    char *json_end = json + fsize;
 
-    while((ptr = strstr(ptr, "\"id\"")) != NULL && count < MAX_TRANSPORTS) {
-        // Save the position after finding "id"
-        char *id_start = ptr;
-
+    while((ptr = strstr(ptr, "\"id\"")) != NULL && count < MAX_TRANSPORTS && ptr < json_end) {
         // Extract ID
         ptr = strchr(ptr, ':');
-        if(!ptr) break;
+        if(!ptr || ptr >= json_end) break;
         ptr++;
-        while(*ptr == ' ' || *ptr == '"') ptr++;
+
+        // Skip whitespace and quotes
+        while(ptr < json_end && (*ptr == ' ' || *ptr == '"')) ptr++;
+        if(ptr >= json_end) break;
+
         char *id_end = strchr(ptr, '"');
-        if(!id_end) break;
+        if(!id_end || id_end >= json_end) break;
 
         int id_len = id_end - ptr;
-        if(id_len >= sizeof(transports[count].transport_id)) {
+        if(id_len >= (int)sizeof(transports[count].transport_id)) {
             id_len = sizeof(transports[count].transport_id) - 1;
         }
         strncpy(transports[count].transport_id, ptr, id_len);
         transports[count].transport_id[id_len] = 0;
 
-        // Find the next "id" field or end of file to limit search
+        // Find the next "id" field or use end of buffer
         char *next_id = strstr(id_end, "\"id\"");
-        char *search_end = next_id ? next_id : (json + fsize);
+        char *search_end = (next_id && next_id < json_end) ? next_id : json_end;
 
-        // Look for metrics_port (search forward from current position until next object)
-        char *metrics_ptr = strstr(id_end, "\"metrics_port\"");
-        if(metrics_ptr && metrics_ptr < search_end) {
-            metrics_ptr = strchr(metrics_ptr, ':');
-            if(metrics_ptr) {
-                transports[count].metrics_port = atoi(metrics_ptr + 1);
+        // Initialize defaults
+        transports[count].metrics_port = 0;
+        transports[count].active = 0;
+
+        // Look for metrics_port within this transport object
+        char *metrics_ptr = id_end;
+        while(metrics_ptr < search_end) {
+            metrics_ptr = strstr(metrics_ptr, "\"metrics_port\"");
+            if(!metrics_ptr || metrics_ptr >= search_end) break;
+
+            char *colon = strchr(metrics_ptr, ':');
+            if(colon && colon < search_end) {
+                transports[count].metrics_port = atoi(colon + 1);
             }
+            break;
         }
 
         // Look for status
-        char *status_ptr = strstr(id_end, "\"status\"");
-        if(status_ptr && status_ptr < search_end) {
-            status_ptr = strchr(status_ptr, ':');
-            if(status_ptr) {
-                // Look for "running" within a reasonable distance
-                char *running_check = status_ptr;
-                while(*running_check && running_check < (status_ptr + 20)) {
-                    if(strncmp(running_check, "running", 7) == 0) {
+        char *status_ptr = id_end;
+        while(status_ptr < search_end) {
+            status_ptr = strstr(status_ptr, "\"status\"");
+            if(!status_ptr || status_ptr >= search_end) break;
+
+            char *colon = strchr(status_ptr, ':');
+            if(colon && colon < search_end) {
+                // Check if "running" appears within next 30 chars
+                char *check_end = colon + 30;
+                if(check_end > search_end) check_end = search_end;
+
+                char *running_pos = colon;
+                while(running_pos < check_end) {
+                    if(check_end - running_pos >= 7 &&
+                       strncmp(running_pos, "running", 7) == 0) {
                         transports[count].active = 1;
                         count++;
                         break;
                     }
-                    running_check++;
+                    running_pos++;
                 }
             }
+            break;
         }
 
         ptr = id_end + 1;
