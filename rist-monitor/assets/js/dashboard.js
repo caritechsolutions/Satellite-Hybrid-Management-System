@@ -219,12 +219,20 @@ class Dashboard {
 
     convertMetricsToReceivers(metricsReceivers) {
         return metricsReceivers.map(peer => {
-            // Determine status based on quality
+            // Determine status based on bandwidth and quality
             let status = 'online';
+
+            // Check quality first - if poor, mark as offline
             if (peer.quality < 70) {
                 status = 'offline';
-            } else if (peer.quality < 95) {
-                status = 'fsr'; // Forward Error Correction
+            }
+            // If quality is good, check bandwidth to determine if actively recovering
+            else if (peer.bandwidth_mbps >= 0.1) {
+                // High bandwidth (>= 100 Kbps) means actively forwarding/recovering video
+                status = 'fsr'; // Forward Error Correction - actively recovering
+            } else {
+                // Low bandwidth (< 100 Kbps) means just keepalives - connected but idle
+                status = 'online';
             }
 
             return {
