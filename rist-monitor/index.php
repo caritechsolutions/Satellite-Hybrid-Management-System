@@ -55,8 +55,8 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
 
     <div class="main-container">
         <div class="content-area">
-            <!-- Transport Status Card -->
-            <div id="transport-status" class="satellite-overview">
+            <!-- Transport Status Card - HIDDEN per user request -->
+            <div id="transport-status" class="satellite-overview" style="display: none;">
                 <!-- Dynamically loaded via JavaScript -->
             </div>
 
@@ -104,6 +104,16 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
                     </div>
                     <div id="receivers-content">
                         <!-- Dynamically loaded via JavaScript -->
+                    </div>
+                </div>
+
+                <!-- Receiver Detail Card -->
+                <div id="receiver-detail-card" class="card" style="margin-top: 1.5rem; display: none;">
+                    <h2 class="card-title">Selected Receiver Details</h2>
+                    <div id="receiver-detail-content">
+                        <div style="color: #9ca3af; text-align: center; padding: 2rem;">
+                            Click a receiver to view details
+                        </div>
                     </div>
                 </div>
             </div>
