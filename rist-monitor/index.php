@@ -106,12 +106,6 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
                         <!-- Dynamically loaded via JavaScript -->
                     </div>
                 </div>
-
-                <!-- Receiver Detail Card -->
-                <div class="receiver-detail" style="margin-top: 1.5rem; padding: 1.5rem; background: #1f2937; border-radius: 0.5rem; display: none;">
-                    <!-- Dynamically populated when a receiver is selected -->
-                    <div style="color: #9ca3af; text-align: center;">Select a receiver to view details</div>
-                </div>
             </div>
         </div>
 
