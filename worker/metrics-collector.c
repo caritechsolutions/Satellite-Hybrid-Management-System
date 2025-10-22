@@ -129,7 +129,20 @@ int parse_metrics(const char *data, Peer *peers, int max_peers) {
         char labels[512];
         double value;
 
-        if(sscanf(token, "%255[^{]{%511[^}]} %lf", metric_name, labels, &value) == 3) {
+        int parsed = sscanf(token, "%255[^{]{%511[^}]} %lf", metric_name, labels, &value);
+
+        // Debug: Check if bandwidth line failed to parse
+        if(parsed != 3 && strstr(token, "bandwidth") != NULL) {
+            printf("DEBUG: Failed to parse bandwidth line (parsed=%d): %s\n", parsed, token);
+        }
+
+        if(parsed == 3) {
+            // Debug: Show what we're parsing (only for bandwidth metrics)
+            if(strstr(metric_name, "bandwidth") != NULL) {
+                printf("DEBUG: Parsing line: %s\n", token);
+                printf("DEBUG: metric_name='%s', value=%.0f\n", metric_name, value);
+            }
+
             // Extract peer_id from labels
             char peer_id[32] = {0};
             char *peer_id_start = strstr(labels, "peer_id=\"");
@@ -165,9 +178,13 @@ int parse_metrics(const char *data, Peer *peers, int max_peers) {
                 // Store metric value (check longer strings first!)
                 if(strstr(metric_name, "retry_bandwidth_bps")) {
                     peers[peer_idx].retry_bandwidth_mbps = value / 1000000.0;
+                    printf("DEBUG: peer_id=%s, retry_bandwidth_mbps set to %.3f\n",
+                           peer_id, peers[peer_idx].retry_bandwidth_mbps);
                 }
                 else if(strstr(metric_name, "bandwidth_bps")) {
                     peers[peer_idx].bandwidth_mbps = value / 1000000.0;
+                    printf("DEBUG: peer_id=%s, bandwidth_mbps set to %.3f\n",
+                           peer_id, peers[peer_idx].bandwidth_mbps);
                 }
                 else if(strstr(metric_name, "quality")) {
                     peers[peer_idx].quality = value;
