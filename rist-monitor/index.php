@@ -162,16 +162,58 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
         </div>
     </div>
 
+    <!-- Bandwidth Graph Modal -->
+    <div id="bandwidth-graph-modal" class="modal">
+        <div class="modal-content" style="max-width: 1200px;">
+            <div class="modal-header">
+                <h3>Bandwidth Graph - <span id="graph-receiver-name"></span></h3>
+                <span class="close" onclick="window.bandwidthGraph.hide()">&times;</span>
+            </div>
+
+            <div class="graph-controls">
+                <div class="metric-selector">
+                    <button class="metric-btn active" data-metric="bandwidth" onclick="window.bandwidthGraph.changeMetric('bandwidth')">Bandwidth</button>
+                    <button class="metric-btn" data-metric="quality" onclick="window.bandwidthGraph.changeMetric('quality')">Quality</button>
+                    <button class="metric-btn" data-metric="rtt" onclick="window.bandwidthGraph.changeMetric('rtt')">RTT</button>
+                    <button class="metric-btn" data-metric="packet_loss" onclick="window.bandwidthGraph.changeMetric('packet_loss')">Packet Loss</button>
+                    <button class="metric-btn" data-metric="retry_bandwidth" onclick="window.bandwidthGraph.changeMetric('retry_bandwidth')">Retry BW</button>
+                </div>
+
+                <div class="range-selector">
+                    <button class="range-btn" data-range="5m" onclick="window.bandwidthGraph.changeTimeRange('5m')">5m</button>
+                    <button class="range-btn" data-range="15m" onclick="window.bandwidthGraph.changeTimeRange('15m')">15m</button>
+                    <button class="range-btn" data-range="30m" onclick="window.bandwidthGraph.changeTimeRange('30m')">30m</button>
+                    <button class="range-btn active" data-range="1h" onclick="window.bandwidthGraph.changeTimeRange('1h')">1h</button>
+                    <button class="range-btn" data-range="6h" onclick="window.bandwidthGraph.changeTimeRange('6h')">6h</button>
+                    <button class="range-btn" data-range="24h" onclick="window.bandwidthGraph.changeTimeRange('24h')">24h</button>
+                </div>
+            </div>
+
+            <div class="graph-container">
+                <canvas id="bandwidth-chart"></canvas>
+            </div>
+
+            <div id="graph-stats" class="graph-stats">
+                <!-- Populated dynamically -->
+            </div>
+        </div>
+    </div>
+
     <!-- Leaflet JS for maps -->
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
             integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
             crossorigin=""></script>
+
+    <!-- Chart.js for graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 
     <script src="assets/js/api-client.js"></script>
     <script src="assets/js/transport-config.js"></script>
     <script src="assets/js/dashboard.js"></script>
     <script src="assets/js/real-time.js"></script>
     <script src="assets/js/receiver-map.js"></script>
+    <script src="assets/js/bandwidth-graph.js"></script>
     
     <script>
         // Initialize dashboard with active transport

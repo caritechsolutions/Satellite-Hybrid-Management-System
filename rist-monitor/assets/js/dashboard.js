@@ -450,13 +450,19 @@ class Dashboard {
     }
     
     showBandwidthGraph(boxId) {
-        // This would open a modal with Chart.js graph
-        alert(`Bandwidth graph for ${boxId} would open here`);
-        
-        // TODO: Implement modal with Chart.js
-        // - Fetch historical data from API
-        // - Create time-series chart
-        // - Show real-time updates
+        // Find receiver by box_id
+        const receiver = this.receivers.find(r => r.box_id === boxId);
+        if (!receiver) {
+            alert('Receiver not found');
+            return;
+        }
+
+        // Show bandwidth graph modal
+        if (window.bandwidthGraph) {
+            window.bandwidthGraph.show(receiver);
+        } else {
+            alert('Bandwidth graph component not loaded. Please refresh the page.');
+        }
     }
     
     startRealTimeUpdates() {
