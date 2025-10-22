@@ -312,6 +312,19 @@ int load_transports_from_json() {
     char *ptr = json;
 
     while((ptr = strstr(ptr, "\"id\"")) != NULL && count < MAX_TRANSPORTS) {
+        // Find the start of this object (look backwards for opening brace)
+        char *obj_start = ptr;
+        while(obj_start > json && *obj_start != '{') obj_start--;
+
+        // Find the end of this object (look forward for closing brace, accounting for nesting)
+        char *obj_end = ptr;
+        int brace_count = 0;
+        while(*obj_end && (brace_count > 0 || *obj_end != '}')) {
+            if(*obj_end == '{') brace_count++;
+            if(*obj_end == '}') brace_count--;
+            obj_end++;
+        }
+
         // Extract ID
         ptr = strchr(ptr, ':');
         if(!ptr) break;
@@ -327,26 +340,31 @@ int load_transports_from_json() {
         strncpy(transports[count].transport_id, ptr, id_len);
         transports[count].transport_id[id_len] = 0;
 
-        // Look for metrics_port
-        char *metrics_ptr = strstr(ptr, "\"metrics_port\"");
-        if(metrics_ptr && (metrics_ptr - ptr) < 500) { // Within same object
+        // Look for metrics_port within this object
+        char *metrics_ptr = obj_start;
+        while(metrics_ptr < obj_end && (metrics_ptr = strstr(metrics_ptr, "\"metrics_port\"")) != NULL) {
+            if(metrics_ptr > obj_end) break;
             metrics_ptr = strchr(metrics_ptr, ':');
-            if(metrics_ptr) {
+            if(metrics_ptr && metrics_ptr < obj_end) {
                 transports[count].metrics_port = atoi(metrics_ptr + 1);
+                break;
             }
         }
 
-        // Look for status
-        char *status_ptr = strstr(ptr, "\"status\"");
-        if(status_ptr && (status_ptr - ptr) < 500) {
+        // Look for status within this object
+        char *status_ptr = obj_start;
+        while(status_ptr < obj_end && (status_ptr = strstr(status_ptr, "\"status\"")) != NULL) {
+            if(status_ptr > obj_end) break;
             status_ptr = strchr(status_ptr, ':');
-            if(status_ptr && strstr(status_ptr, "running")) {
+            if(status_ptr && status_ptr < obj_end && strstr(status_ptr, "running")) {
                 transports[count].active = 1;
                 count++;
+                break;
             }
+            status_ptr++;
         }
 
-        ptr = id_end + 1;
+        ptr = obj_end + 1;
     }
 
     free(json);
