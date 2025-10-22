@@ -312,18 +312,8 @@ int load_transports_from_json() {
     char *ptr = json;
 
     while((ptr = strstr(ptr, "\"id\"")) != NULL && count < MAX_TRANSPORTS) {
-        // Find the start of this object (look backwards for opening brace)
-        char *obj_start = ptr;
-        while(obj_start > json && *obj_start != '{') obj_start--;
-
-        // Find the end of this object (look forward for closing brace, accounting for nesting)
-        char *obj_end = ptr;
-        int brace_count = 0;
-        while(*obj_end && (brace_count > 0 || *obj_end != '}')) {
-            if(*obj_end == '{') brace_count++;
-            if(*obj_end == '}') brace_count--;
-            obj_end++;
-        }
+        // Save the position after finding "id"
+        char *id_start = ptr;
 
         // Extract ID
         ptr = strchr(ptr, ':');
@@ -340,31 +330,38 @@ int load_transports_from_json() {
         strncpy(transports[count].transport_id, ptr, id_len);
         transports[count].transport_id[id_len] = 0;
 
-        // Look for metrics_port within this object
-        char *metrics_ptr = obj_start;
-        while(metrics_ptr < obj_end && (metrics_ptr = strstr(metrics_ptr, "\"metrics_port\"")) != NULL) {
-            if(metrics_ptr > obj_end) break;
+        // Find the next "id" field or end of file to limit search
+        char *next_id = strstr(id_end, "\"id\"");
+        char *search_end = next_id ? next_id : (json + fsize);
+
+        // Look for metrics_port (search forward from current position until next object)
+        char *metrics_ptr = strstr(id_end, "\"metrics_port\"");
+        if(metrics_ptr && metrics_ptr < search_end) {
             metrics_ptr = strchr(metrics_ptr, ':');
-            if(metrics_ptr && metrics_ptr < obj_end) {
+            if(metrics_ptr) {
                 transports[count].metrics_port = atoi(metrics_ptr + 1);
-                break;
             }
         }
 
-        // Look for status within this object
-        char *status_ptr = obj_start;
-        while(status_ptr < obj_end && (status_ptr = strstr(status_ptr, "\"status\"")) != NULL) {
-            if(status_ptr > obj_end) break;
+        // Look for status
+        char *status_ptr = strstr(id_end, "\"status\"");
+        if(status_ptr && status_ptr < search_end) {
             status_ptr = strchr(status_ptr, ':');
-            if(status_ptr && status_ptr < obj_end && strstr(status_ptr, "running")) {
-                transports[count].active = 1;
-                count++;
-                break;
+            if(status_ptr) {
+                // Look for "running" within a reasonable distance
+                char *running_check = status_ptr;
+                while(*running_check && running_check < (status_ptr + 20)) {
+                    if(strncmp(running_check, "running", 7) == 0) {
+                        transports[count].active = 1;
+                        count++;
+                        break;
+                    }
+                    running_check++;
+                }
             }
-            status_ptr++;
         }
 
-        ptr = obj_end + 1;
+        ptr = id_end + 1;
     }
 
     free(json);

@@ -147,6 +147,13 @@ echo ""
 echo "Step 4: Installing..."
 echo "──────────────────────"
 
+# Stop the service if it's running (for upgrades)
+if systemctl is-active --quiet metrics-collector; then
+    echo "Stopping existing metrics-collector service..."
+    systemctl stop metrics-collector
+    sleep 1
+fi
+
 cp metrics-collector /usr/local/bin/
 chmod +x /usr/local/bin/metrics-collector
 echo "✓ Binary installed to /usr/local/bin/metrics-collector"
