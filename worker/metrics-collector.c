@@ -162,12 +162,12 @@ int parse_metrics(const char *data, Peer *peers, int max_peers) {
                     }
                 }
 
-                // Store metric value
-                if(strstr(metric_name, "bandwidth_bps")) {
-                    peers[peer_idx].bandwidth_mbps = value / 1000000.0;
-                }
-                else if(strstr(metric_name, "retry_bandwidth_bps")) {
+                // Store metric value (check longer strings first!)
+                if(strstr(metric_name, "retry_bandwidth_bps")) {
                     peers[peer_idx].retry_bandwidth_mbps = value / 1000000.0;
+                }
+                else if(strstr(metric_name, "bandwidth_bps")) {
+                    peers[peer_idx].bandwidth_mbps = value / 1000000.0;
                 }
                 else if(strstr(metric_name, "quality")) {
                     peers[peer_idx].quality = value;
