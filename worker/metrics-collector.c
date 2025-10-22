@@ -271,9 +271,17 @@ void* transport_worker(void *arg) {
             // Store in Redis
             if(peer_count > 0) {
                 store_metrics(transport->transport_id, peers, peer_count);
+
+                // Debug: Show all peers and their bandwidth
+                double total_bandwidth = 0;
+                for(int i = 0; i < peer_count; i++) {
+                    total_bandwidth += peers[i].bandwidth_mbps;
+                    printf("[%s] Peer %s (%s): BW=%.3f Mbps, Q=%.1f%%, RTT=%.2f ms\n",
+                           transport->transport_id, peers[i].peer_id, peers[i].cname,
+                           peers[i].bandwidth_mbps, peers[i].quality, peers[i].rtt_ms);
+                }
                 printf("[%s] Collected %d peers (%.2f Mbps total)\n",
-                       transport->transport_id, peer_count,
-                       peers[0].bandwidth_mbps); // Show first peer's bandwidth
+                       transport->transport_id, peer_count, total_bandwidth);
             } else {
                 printf("[%s] No peers found\n", transport->transport_id);
             }
