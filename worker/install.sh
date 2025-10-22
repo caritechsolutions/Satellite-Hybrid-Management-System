@@ -63,38 +63,63 @@ echo "────────────────────────�
 
 REDIS_TS_INSTALLED=0
 
-if redis-cli MODULE LIST 2>/dev/null | grep -q "timeseries"; then
-    echo "✓ Redis TimeSeries module is installed"
-    REDIS_TS_INSTALLED=1
-else
-    echo "⚠ Redis TimeSeries module not found"
-    echo ""
-    echo "Options:"
-    echo "  1. Install redis-timeseries package (if available)"
-    echo "  2. Use Redis Stack Docker container"
-    echo ""
-    read -p "Install Redis Stack via Docker? (y/n): " -n 1 -r
-    echo ""
+# Make sure Redis is running before checking modules
+if ! systemctl is-active --quiet redis-server; then
+    echo "Starting Redis..."
+    systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null || true
+    sleep 2
+fi
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Check if Docker is installed
-        if command -v docker &> /dev/null; then
-            echo "Starting Redis Stack container..."
-            docker run -d -p 6379:6379 \
-                --name redis-stack \
-                --restart unless-stopped \
-                redis/redis-stack-server:latest
-
-            echo "✓ Redis Stack container started"
-            REDIS_TS_INSTALLED=1
-        else
-            echo "Docker not found. Please install Docker or Redis TimeSeries module manually."
-            echo "Continuing anyway... (basic Redis will work, but historical data won't be stored)"
-        fi
+# Check if Redis is responding
+if redis-cli ping > /dev/null 2>&1; then
+    # Check for TimeSeries module
+    if redis-cli MODULE LIST 2>/dev/null | grep -q "timeseries"; then
+        echo "✓ Redis TimeSeries module is installed"
+        REDIS_TS_INSTALLED=1
     else
-        echo "Continuing without TimeSeries support..."
-        echo "(Metrics will be collected but not stored historically)"
+        echo "⚠ Redis TimeSeries module not found"
+        echo ""
+        echo "TimeSeries module is required for historical metrics graphs."
+        echo ""
+        echo "Installation options:"
+        echo "  1. Install Redis from official repo (includes TimeSeries)"
+        echo "  2. Use Redis Stack Docker container"
+        echo ""
+        read -p "Install Redis with TimeSeries? (y/n): " -n 1 -r
+        echo ""
+
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo "Installing Redis from official repository..."
+
+            # Add Redis repository
+            curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/redis.list
+
+            # Install/upgrade Redis
+            apt-get update -qq
+            apt-get install -y redis-server
+
+            # Restart Redis
+            systemctl restart redis-server
+            sleep 2
+
+            # Check again
+            if redis-cli MODULE LIST 2>/dev/null | grep -q "timeseries"; then
+                echo "✓ Redis TimeSeries module installed successfully"
+                REDIS_TS_INSTALLED=1
+            else
+                echo "⚠ TimeSeries module still not available"
+                echo "  Try Docker alternative: docker run -d -p 6379:6379 redis/redis-stack-server"
+            fi
+        else
+            echo "Continuing without TimeSeries support..."
+            echo "(Metrics will be collected but historical graphs won't work)"
+        fi
     fi
+else
+    echo "⚠ Cannot connect to Redis"
+    echo "  Please ensure Redis is installed and running"
+    echo "  Install with: sudo apt-get install redis-server"
 fi
 
 echo ""
@@ -206,10 +231,14 @@ echo ""
 
 if [ $REDIS_TS_INSTALLED -eq 0 ]; then
     echo "⚠ WARNING: Redis TimeSeries is not installed"
-    echo "  Historical data will not be stored"
+    echo "  Historical data will not be stored (graphs won't work)"
     echo "  To install:"
-    echo "    - Docker: docker run -d -p 6379:6379 redis/redis-stack-server"
-    echo "    - Or: sudo apt-get install redis-timeseries"
+    echo "    1. Add Redis repo and upgrade:"
+    echo "       curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg"
+    echo "       echo 'deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb \$(lsb_release -cs) main' | sudo tee /etc/apt/sources.list.d/redis.list"
+    echo "       sudo apt update && sudo apt install redis-server"
+    echo "    2. Or use Docker:"
+    echo "       docker run -d -p 6379:6379 --restart unless-stopped redis/redis-stack-server"
     echo ""
 fi
 
