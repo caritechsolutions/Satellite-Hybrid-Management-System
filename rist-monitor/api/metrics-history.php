@@ -86,13 +86,24 @@ try {
 
     // Format response
     $formattedData = [];
+    $debugInfo = [];
     if (is_array($result)) {
-        // DEBUG: Log first few raw results
+        // DEBUG: Capture first point for debugging
         if (count($result) > 0) {
-            error_log("DEBUG metrics-history: First point raw: " . print_r($result[0], true));
-            error_log("DEBUG metrics-history: point[0] type: " . gettype($result[0][0]) . " value: " . $result[0][0]);
-            error_log("DEBUG metrics-history: point[1] type: " . gettype($result[0][1]) . " value: " . $result[0][1]);
-            error_log("DEBUG metrics-history: point[1] as float: " . (float)$result[0][1]);
+            $debugInfo = [
+                'first_point_raw' => $result[0],
+                'first_point_types' => [
+                    'timestamp_type' => gettype($result[0][0]),
+                    'value_type' => gettype($result[0][1])
+                ],
+                'first_point_values' => [
+                    'timestamp_raw' => $result[0][0],
+                    'value_raw' => $result[0][1],
+                    'value_as_string' => (string)$result[0][1],
+                    'value_as_float' => (float)$result[0][1],
+                    'value_sprintf' => sprintf('%.3f', (float)$result[0][1])
+                ]
+            ];
         }
 
         foreach ($result as $point) {
@@ -127,6 +138,7 @@ try {
         'total_samples' => $totalSamples,
         'returned_points' => count($formattedData),
         'aggregation_interval_ms' => $aggregationInterval,
+        'debug' => $debugInfo,  // Temporary debug info
         'data' => $formattedData
     ]);
 
