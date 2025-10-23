@@ -372,6 +372,8 @@ int load_transports_from_json() {
         strncpy(transports[count].transport_id, ptr, id_len);
         transports[count].transport_id[id_len] = 0;
 
+        printf("DEBUG: Parsing transport ID: %s\n", transports[count].transport_id);
+
         // Find the next "id" field or use end of buffer
         char *next_id = strstr(id_end, "\"id\"");
         char *search_end = (next_id && next_id < json_end) ? next_id : json_end;
@@ -384,11 +386,18 @@ int load_transports_from_json() {
         char *metrics_ptr = id_end;
         while(metrics_ptr < search_end) {
             metrics_ptr = strstr(metrics_ptr, "\"metrics_port\"");
-            if(!metrics_ptr || metrics_ptr >= search_end) break;
+            if(!metrics_ptr || metrics_ptr >= search_end) {
+                printf("DEBUG: metrics_port field not found for %s\n", transports[count].transport_id);
+                break;
+            }
 
             char *colon = strchr(metrics_ptr, ':');
             if(colon && colon < search_end) {
                 transports[count].metrics_port = atoi(colon + 1);
+                printf("DEBUG: Found metrics_port=%d for %s\n",
+                       transports[count].metrics_port, transports[count].transport_id);
+            } else {
+                printf("DEBUG: Failed to parse metrics_port value for %s\n", transports[count].transport_id);
             }
             break;
         }
@@ -397,7 +406,10 @@ int load_transports_from_json() {
         char *status_ptr = id_end;
         while(status_ptr < search_end) {
             status_ptr = strstr(status_ptr, "\"status\"");
-            if(!status_ptr || status_ptr >= search_end) break;
+            if(!status_ptr || status_ptr >= search_end) {
+                printf("DEBUG: status field not found for %s\n", transports[count].transport_id);
+                break;
+            }
 
             char *colon = strchr(status_ptr, ':');
             if(colon && colon < search_end) {
@@ -406,14 +418,21 @@ int load_transports_from_json() {
                 if(check_end > search_end) check_end = search_end;
 
                 char *running_pos = colon;
+                int found_running = 0;
                 while(running_pos < check_end) {
                     if(check_end - running_pos >= 7 &&
                        strncmp(running_pos, "running", 7) == 0) {
                         transports[count].active = 1;
+                        found_running = 1;
+                        printf("DEBUG: Transport %s is RUNNING with port %d - ADDING to list\n",
+                               transports[count].transport_id, transports[count].metrics_port);
                         count++;
                         break;
                     }
                     running_pos++;
+                }
+                if(!found_running) {
+                    printf("DEBUG: Transport %s is NOT running - skipping\n", transports[count].transport_id);
                 }
             }
             break;
