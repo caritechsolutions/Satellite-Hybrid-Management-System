@@ -378,6 +378,14 @@ int load_transports_from_json() {
         char *next_id = strstr(id_end, "\"id\"");
         char *search_end = (next_id && next_id < json_end) ? next_id : json_end;
 
+        int search_len = search_end - id_end;
+        printf("DEBUG: Search range is %d bytes from id_end\n", search_len);
+        if(search_len > 0 && search_len < 500) {
+            // Print first 200 chars of search range for inspection
+            int preview_len = (search_len < 200) ? search_len : 200;
+            printf("DEBUG: Search preview (first %d chars): %.200s\n", preview_len, id_end);
+        }
+
         // Initialize defaults
         transports[count].metrics_port = 0;
         transports[count].active = 0;
