@@ -3,39 +3,6 @@
 ?>
 
 <div class="sidebar">
-    <!-- Selected Receiver Detail -->
-    <div class="receiver-detail">
-        <div class="detail-header">
-            <div class="detail-title">Select a Receiver</div>
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-                <span class="status-dot status-offline"></span>
-                <span>None Selected</span>
-            </div>
-        </div>
-        <div class="detail-metrics">
-            <div class="detail-metric">
-                <div class="detail-metric-value">-</div>
-                <div class="detail-metric-label">Bandwidth</div>
-            </div>
-            <div class="detail-metric">
-                <div class="detail-metric-value">-</div>
-                <div class="detail-metric-label">RTT</div>
-            </div>
-            <div class="detail-metric">
-                <div class="detail-metric-value">-</div>
-                <div class="detail-metric-label">Packet Loss</div>
-            </div>
-            <div class="detail-metric">
-                <div class="detail-metric-value">-</div>
-                <div class="detail-metric-label">Signal Quality</div>
-            </div>
-        </div>
-        <div class="detail-info">
-            <div class="detail-info-label">IP Address</div>
-            <div class="detail-info-value">Click a receiver to view details</div>
-        </div>
-    </div>
-
     <!-- Advanced Features Section -->
     <div class="advanced-features">
         <h3 class="sidebar-title">Advanced Features</h3>
