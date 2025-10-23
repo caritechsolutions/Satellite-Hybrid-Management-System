@@ -404,10 +404,10 @@ int load_transports_from_json() {
 
         int search_len = search_end - id_end;
         printf("DEBUG: Search range is %d bytes from id_end\n", search_len);
-        if(search_len > 0 && search_len < 500) {
-            // Print first 200 chars of search range for inspection
-            int preview_len = (search_len < 200) ? search_len : 200;
-            printf("DEBUG: Search preview (first %d chars): %.200s\n", preview_len, id_end);
+        if(search_len > 0 && search_len < 2000) {
+            // Print first 300 chars of search range for inspection
+            int preview_len = (search_len < 300) ? search_len : 300;
+            printf("DEBUG: Search preview (first %d chars): %.*s\n", preview_len, preview_len, id_end);
         }
 
         // Initialize defaults
