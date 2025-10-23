@@ -162,6 +162,7 @@ int parse_metrics(const char *data, Peer *peers, int max_peers) {
                     peer_idx = peer_count++;
                     memset(&peers[peer_idx], 0, sizeof(Peer));
                     strncpy(peers[peer_idx].peer_id, peer_id, sizeof(peers[peer_idx].peer_id) - 1);
+                    peers[peer_idx].peer_id[sizeof(peers[peer_idx].peer_id) - 1] = '\0';  // Ensure null-termination
 
                     // Extract other labels
                     char *cname_start = strstr(labels, "cname=\"");
