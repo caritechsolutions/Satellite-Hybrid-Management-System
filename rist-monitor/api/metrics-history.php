@@ -69,49 +69,54 @@ try {
         ]);
     }
 
-    // Query Redis TimeSeries
-    // Format: TS.RANGE key fromTimestamp toTimestamp [AGGREGATION type bucketSize]
+    // Query Redis TimeSeries using redis-cli to avoid PhpRedis parsing bug
+    // PhpRedis incorrectly parses TS.RANGE decimal values as booleans
     $aggregationInterval = 5000; // 5 seconds (matches collection interval)
 
-    // Use aggregation for longer time ranges
+    // Build redis-cli command
     if ($timeRangeMs > 3600 * 1000) { // > 1 hour
-        // 1-minute aggregation for 1-24 hour ranges
         $aggregationInterval = 60000;
-        $result = $redis->rawCommand('TS.RANGE', $key, (string)$fromTimestamp, (string)$now,
-                                     'AGGREGATION', 'avg', (string)$aggregationInterval);
+        $cmd = sprintf(
+            'redis-cli TS.RANGE %s %s %s AGGREGATION avg %d 2>/dev/null',
+            escapeshellarg($key),
+            escapeshellarg((string)$fromTimestamp),
+            escapeshellarg((string)$now),
+            $aggregationInterval
+        );
     } else {
-        // Raw data for < 1 hour
-        $result = $redis->rawCommand('TS.RANGE', $key, (string)$fromTimestamp, (string)$now);
+        $cmd = sprintf(
+            'redis-cli TS.RANGE %s %s %s 2>/dev/null',
+            escapeshellarg($key),
+            escapeshellarg((string)$fromTimestamp),
+            escapeshellarg((string)$now)
+        );
     }
 
-    // Format response
-    $formattedData = [];
-    $debugInfo = [];
-    if (is_array($result)) {
-        // DEBUG: Capture first point for debugging
-        if (count($result) > 0) {
-            $debugInfo = [
-                'first_point_raw' => $result[0],
-                'first_point_types' => [
-                    'timestamp_type' => gettype($result[0][0]),
-                    'value_type' => gettype($result[0][1])
-                ],
-                'first_point_values' => [
-                    'timestamp_raw' => $result[0][0],
-                    'value_raw' => $result[0][1],
-                    'value_as_string' => (string)$result[0][1],
-                    'value_as_float' => (float)$result[0][1],
-                    'value_sprintf' => sprintf('%.3f', (float)$result[0][1])
-                ]
-            ];
-        }
+    // Execute and parse output
+    $output = shell_exec($cmd);
 
-        foreach ($result as $point) {
-            if (is_array($point) && count($point) === 2) {
+    // Parse redis-cli output format
+    // Format: 1) 1) (integer) timestamp\n   2) value
+    $formattedData = [];
+    if ($output) {
+        $lines = explode("\n", trim($output));
+        $currentTimestamp = null;
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+
+            // Match timestamp line: "1) (integer) 1761201298266"
+            if (preg_match('/\(integer\)\s+(\d+)/', $line, $matches)) {
+                $currentTimestamp = (int)$matches[1];
+            }
+            // Match value line: "2) 1.949" or "2) 1.6E-2"
+            else if ($currentTimestamp !== null && preg_match('/^\d+\)\s+([\d.E+-]+)/', $line, $matches)) {
+                $value = (float)$matches[1];
                 $formattedData[] = [
-                    'timestamp' => (int)$point[0],
-                    'value' => (float)$point[1]
+                    'timestamp' => $currentTimestamp,
+                    'value' => $value
                 ];
+                $currentTimestamp = null; // Reset for next pair
             }
         }
     }
@@ -138,7 +143,6 @@ try {
         'total_samples' => $totalSamples,
         'returned_points' => count($formattedData),
         'aggregation_interval_ms' => $aggregationInterval,
-        'debug' => $debugInfo,  // Temporary debug info
         'data' => $formattedData
     ]);
 
