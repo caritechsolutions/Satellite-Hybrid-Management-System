@@ -232,14 +232,29 @@ void store_metrics(const char *transport_id, Peer *peers, int peer_count) {
 
         // Ensure TimeSeries exists with proper encoding for floating point
         reply = redisCommand(redis_ctx, "TS.CREATE %s RETENTION 86400000 DUPLICATE_POLICY LAST ENCODING COMPRESSED", key);
-        if(reply && reply->type == REDIS_REPLY_ERROR) {
-            // Key already exists, that's fine
+        if(reply) {
+            if(reply->type == REDIS_REPLY_ERROR) {
+                // Check if it's just "key already exists" (that's fine)
+                if(strstr(reply->str, "already exists") == NULL) {
+                    printf("ERROR: TS.CREATE failed for %s: %s\n", key, reply->str);
+                }
+            }
+            freeReplyObject(reply);
+        } else {
+            printf("ERROR: TS.CREATE returned NULL for %s\n", key);
         }
-        if(reply) freeReplyObject(reply);
 
         reply = redisCommand(redis_ctx, "TS.ADD %s %lld %.3f",
                             key, timestamp, peers[i].bandwidth_mbps);
-        if(reply) freeReplyObject(reply);
+        if(reply) {
+            if(reply->type == REDIS_REPLY_ERROR) {
+                printf("ERROR: TS.ADD failed for %s: %s (value=%.3f)\n",
+                       key, reply->str, peers[i].bandwidth_mbps);
+            }
+            freeReplyObject(reply);
+        } else {
+            printf("ERROR: TS.ADD returned NULL for %s\n", key);
+        }
 
         // Store quality
         snprintf(key, sizeof(key), "metrics:%s:%s:quality",
