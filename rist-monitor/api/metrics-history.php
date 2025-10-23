@@ -87,6 +87,14 @@ try {
     // Format response
     $formattedData = [];
     if (is_array($result)) {
+        // DEBUG: Log first few raw results
+        if (count($result) > 0) {
+            error_log("DEBUG metrics-history: First point raw: " . print_r($result[0], true));
+            error_log("DEBUG metrics-history: point[0] type: " . gettype($result[0][0]) . " value: " . $result[0][0]);
+            error_log("DEBUG metrics-history: point[1] type: " . gettype($result[0][1]) . " value: " . $result[0][1]);
+            error_log("DEBUG metrics-history: point[1] as float: " . (float)$result[0][1]);
+        }
+
         foreach ($result as $point) {
             if (is_array($point) && count($point) === 2) {
                 $formattedData[] = [
