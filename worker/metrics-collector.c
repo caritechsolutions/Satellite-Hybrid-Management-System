@@ -229,7 +229,15 @@ void store_metrics(const char *transport_id, Peer *peers, int peer_count) {
         // Store bandwidth
         snprintf(key, sizeof(key), "metrics:%s:%s:bandwidth",
                  transport_id, peers[i].peer_id);
-        reply = redisCommand(redis_ctx, "TS.ADD %s %lld %.3f RETENTION 86400000",
+
+        // Ensure TimeSeries exists with proper encoding for floating point
+        reply = redisCommand(redis_ctx, "TS.CREATE %s RETENTION 86400000 DUPLICATE_POLICY LAST ENCODING COMPRESSED", key);
+        if(reply && reply->type == REDIS_REPLY_ERROR) {
+            // Key already exists, that's fine
+        }
+        if(reply) freeReplyObject(reply);
+
+        reply = redisCommand(redis_ctx, "TS.ADD %s %lld %.3f",
                             key, timestamp, peers[i].bandwidth_mbps);
         if(reply) freeReplyObject(reply);
 
