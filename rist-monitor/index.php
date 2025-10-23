@@ -55,8 +55,8 @@ $activeTransport = isset($_GET['transport']) ? $_GET['transport'] : ($transports
 
     <div class="main-container">
         <div class="content-area">
-            <!-- Transport Status Card - HIDDEN per user request -->
-            <div id="transport-status" class="satellite-overview" style="display: none;">
+            <!-- Transport Status Card -->
+            <div id="transport-status" class="satellite-overview">
                 <!-- Dynamically loaded via JavaScript -->
             </div>
 
