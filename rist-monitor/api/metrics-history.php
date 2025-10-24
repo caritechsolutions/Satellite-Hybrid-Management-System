@@ -95,29 +95,21 @@ try {
     // Execute and parse output
     $output = shell_exec($cmd);
 
-    // Parse redis-cli output format
-    // Format: 1) 1) (integer) timestamp\n   2) value
+    // Parse redis-cli output format (simple alternating lines)
+    // Line 1: timestamp, Line 2: value, Line 3: timestamp, Line 4: value, ...
     $formattedData = [];
     if ($output) {
-        $lines = explode("\n", trim($output));
-        $currentTimestamp = null;
+        $lines = array_values(array_filter(explode("\n", $output), 'strlen')); // Remove empty lines
 
-        foreach ($lines as $line) {
-            $line = trim($line);
+        // Process pairs of lines (timestamp, value)
+        for ($i = 0; $i < count($lines) - 1; $i += 2) {
+            $timestamp = (int)trim($lines[$i]);
+            $value = (float)trim($lines[$i + 1]);
 
-            // Match timestamp line: "1) (integer) 1761201298266"
-            if (preg_match('/\(integer\)\s+(\d+)/', $line, $matches)) {
-                $currentTimestamp = (int)$matches[1];
-            }
-            // Match value line: "2) 1.949" or "2) 1.6E-2"
-            else if ($currentTimestamp !== null && preg_match('/^\d+\)\s+([\d.E+-]+)/', $line, $matches)) {
-                $value = (float)$matches[1];
-                $formattedData[] = [
-                    'timestamp' => $currentTimestamp,
-                    'value' => $value
-                ];
-                $currentTimestamp = null; // Reset for next pair
-            }
+            $formattedData[] = [
+                'timestamp' => $timestamp,
+                'value' => $value
+            ];
         }
     }
 
