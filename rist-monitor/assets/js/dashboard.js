@@ -104,6 +104,9 @@ class Dashboard {
         const rtt = satellitePeer?.rtt_ms || '-';
         const packetLoss = satellitePeer ? this.calculatePacketLoss(satellitePeer) : '0.0';
 
+        // Store satellite peer data for graph access
+        this.satellitePeer = satellitePeer;
+
         statusContainer.innerHTML = `
             <span class="satellite-icon pulse">&#128752;</span>
             <div class="satellite-name">${satellite.name}</div>
@@ -131,6 +134,13 @@ class Dashboard {
             <div class="control-buttons">
                 ${this.getControlButtons(transport.id, status.status)}
             </div>
+
+            ${satellitePeer ? `
+                <button class="btn btn-primary" style="width: 100%; margin-top: 0.75rem;"
+                        onclick="dashboard.showSatelliteGraph()">
+                    &#128200; Show Satellite Graph
+                </button>
+            ` : ''}
         `;
 
         // Update status class based on quality
@@ -464,7 +474,34 @@ class Dashboard {
             alert('Bandwidth graph component not loaded. Please refresh the page.');
         }
     }
-    
+
+    showSatelliteGraph() {
+        if (!this.satellitePeer) {
+            alert('Satellite peer data not available');
+            return;
+        }
+
+        // Create a receiver-like object for the satellite peer
+        const satelliteReceiver = {
+            box_id: this.satellitePeer.cname || `Satellite Peer ${this.satellitePeer.peer_id}`,
+            transport_id: this.currentTransport,
+            location: 'Satellite Uplink',
+            ip_address: this.satellitePeer.peer_url || '-',
+            status: 'online',
+            bandwidth: this.satellitePeer.bandwidth_mbps,
+            rtt: `${this.satellitePeer.rtt_ms} ms`,
+            quality: this.satellitePeer.quality,
+            _peer_data: this.satellitePeer
+        };
+
+        // Show bandwidth graph modal with satellite data
+        if (window.bandwidthGraph) {
+            window.bandwidthGraph.show(satelliteReceiver);
+        } else {
+            alert('Bandwidth graph not initialized');
+        }
+    }
+
     startRealTimeUpdates() {
         // Update every 5 seconds for real-time metrics
         this.updateInterval = setInterval(async () => {
