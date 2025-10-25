@@ -10,8 +10,15 @@ User=root
 Group=root
 WorkingDirectory=/opt/rist-monitor/worker
 ExecStart=/usr/local/bin/metrics-collector
+
+# Auto-restart configuration
 Restart=always
-RestartSec=10
+RestartSec=5
+StartLimitInterval=200
+StartLimitBurst=10
+
+# Watchdog for health monitoring
+WatchdogSec=30
 
 # Logging
 StandardOutput=journal

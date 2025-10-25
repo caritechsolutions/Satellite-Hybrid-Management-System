@@ -212,15 +212,58 @@ int parse_metrics(const char *data, Peer *peers, int max_peers) {
     return peer_count;
 }
 
+// Check Redis connection health and reconnect if needed
+int check_redis_connection() {
+    // Check if context exists and is not in error state
+    if(!redis_ctx || redis_ctx->err) {
+        if(redis_ctx) {
+            printf("WARNING: Redis connection in error state: %s - reconnecting...\n", redis_ctx->errstr);
+            redisFree(redis_ctx);
+            redis_ctx = NULL;
+        }
+
+        // Attempt to reconnect
+        redis_ctx = redisConnect("127.0.0.1", 6379);
+        if(redis_ctx == NULL || redis_ctx->err) {
+            fprintf(stderr, "ERROR: Redis reconnection failed: %s\n",
+                    redis_ctx ? redis_ctx->errstr : "Can't allocate context");
+            if(redis_ctx) {
+                redisFree(redis_ctx);
+                redis_ctx = NULL;
+            }
+            return 0;
+        }
+        printf("Redis connection restored successfully\n");
+        return 1;
+    }
+
+    // Test connection with PING
+    redisReply *reply = redisCommand(redis_ctx, "PING");
+    if(!reply) {
+        printf("WARNING: Redis PING failed - connection appears dead, reconnecting...\n");
+        redisFree(redis_ctx);
+        redis_ctx = NULL;
+        return check_redis_connection(); // Recursive call to reconnect
+    }
+
+    freeReplyObject(reply);
+    return 1;
+}
+
 // Store metrics in Redis TimeSeries
 void store_metrics(const char *transport_id, Peer *peers, int peer_count) {
-    if(!redis_ctx) return;
+    pthread_mutex_lock(&redis_mutex);
+
+    // Check Redis connection health before storing
+    if(!check_redis_connection()) {
+        pthread_mutex_unlock(&redis_mutex);
+        fprintf(stderr, "ERROR: Cannot store metrics - Redis connection unavailable\n");
+        return;
+    }
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long long timestamp = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-
-    pthread_mutex_lock(&redis_mutex);
 
     for(int i = 0; i < peer_count; i++) {
         char key[256];
@@ -295,11 +338,25 @@ void store_metrics(const char *transport_id, Peer *peers, int peer_count) {
 // Worker thread for each transport
 void* transport_worker(void *arg) {
     Transport *transport = (Transport *)arg;
+    int iteration = 0;
 
     printf("[%s] Worker started (port %d)\n",
            transport->transport_id, transport->metrics_port);
 
     while(running && transport->active) {
+        iteration++;
+
+        // Periodic health check log every 60 seconds (12 iterations * 5 sec)
+        if(iteration % 12 == 0) {
+            pthread_mutex_lock(&redis_mutex);
+            int redis_ok = check_redis_connection();
+            pthread_mutex_unlock(&redis_mutex);
+            printf("[%s] Health: Redis=%s, Iteration=%d\n",
+                   transport->transport_id,
+                   redis_ok ? "Connected" : "Disconnected",
+                   iteration);
+        }
+
         // Fetch metrics
         char *metrics_data = fetch_metrics(transport->metrics_port);
 
