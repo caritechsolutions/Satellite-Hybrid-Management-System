@@ -57,9 +57,14 @@ esac
 
 # ---------------------------------------------------------------- code
 say "Fetching application code"
-# We chown the tree to www-data, so root's git sees "dubious ownership" on
-# re-runs. Whitelist it before any git command touches the repo.
-git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
+# Older installs chowned the whole tree (including .git) to www-data, which
+# makes root's git refuse with "dubious ownership". Whitelist system-wide:
+# --system writes /etc/gitconfig, so it does not depend on $HOME being set
+# (which it is not, reliably, under `curl | sudo bash`).
+if ! git config --system --get-all safe.directory 2>/dev/null | grep -qx "$APP_DIR"; then
+    git config --system --add safe.directory "$APP_DIR" \
+        || warn "could not add safe.directory exception"
+fi
 
 BACKUP="$(mktemp -d)"
 if [ -d "${APP_DIR}/.git" ]; then
@@ -136,13 +141,18 @@ say "Setting up directories and permissions"
 mkdir -p "${WEB_ROOT}/config" "${WEB_ROOT}/data" "$LOG_DIR"
 touch "${LOG_DIR}/rist-monitor.log"
 
-chown -R www-data:www-data "$APP_DIR" "$LOG_DIR"
+# The code stays root-owned so git never sees "dubious ownership" (and the
+# web user cannot rewrite its own application). Only the state directories
+# and the log are handed to www-data.
+chown -R root:root "$APP_DIR"
 find "$APP_DIR" -type d -exec chmod 755 {} \;
 find "$APP_DIR" -type f -exec chmod 644 {} \;
+
+chown -R www-data:www-data "${WEB_ROOT}/config" "${WEB_ROOT}/data" "$LOG_DIR"
 chmod 775 "${WEB_ROOT}/config" "${WEB_ROOT}/data"
 chmod 664 "${WEB_ROOT}"/config/*.json "${WEB_ROOT}"/data/*.json 2>/dev/null || true
 chmod 775 "$LOG_DIR"; chmod 664 "${LOG_DIR}/rist-monitor.log"
-info "owner www-data; config/ and data/ writable"
+info "code root-owned; config/, data/ and logs writable by www-data"
 
 # The UI manages channels as systemd units. Rather than granting www-data a
 # broad root cp/rm, a narrow helper installs only ristsender-*/ristmarker-* units.
