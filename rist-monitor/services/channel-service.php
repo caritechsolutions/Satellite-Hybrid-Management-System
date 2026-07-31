@@ -118,9 +118,18 @@ class ChannelService
             if ($ch['id'] === $id) throw new Exception("A channel named '{$name}' already exists");
         }
 
+        $serviceId = $this->validId($input['service_id'] ?? 0, 'Service ID', true);
+        foreach ($data['channels'] as $ch) {
+            if ((int)($ch['service_id'] ?? 0) === $serviceId) {
+                throw new Exception("Service ID {$serviceId} is already used by channel '{$ch['name']}'");
+            }
+        }
+
         $channel = [
             'id'             => $id,
             'name'           => $name,
+            'service_id'     => $serviceId,
+            'ts_id'          => $this->validId($input['ts_id'] ?? 0, 'Transport stream ID', false),
             'input_url'      => $this->normaliseUdp($input['input_url'] ?? '', true),
             'uplink_url'     => $this->normaliseUdp($input['uplink_url'] ?? '', false),
             'marker_pid'     => $this->validPid($input['marker_pid'] ?? DEFAULT_MARKER_PID),
@@ -152,6 +161,16 @@ class ChannelService
             $found = true;
 
             if (isset($input['name']) && trim($input['name']) !== '') $ch['name'] = trim($input['name']);
+            if (isset($input['service_id'])) {
+                $sid = $this->validId($input['service_id'], 'Service ID', true);
+                foreach ($data['channels'] as $other) {
+                    if ($other['id'] !== $id && (int)($other['service_id'] ?? 0) === $sid) {
+                        throw new Exception("Service ID {$sid} is already used by channel '{$other['name']}'");
+                    }
+                }
+                $ch['service_id'] = $sid;
+            }
+            if (isset($input['ts_id'])) $ch['ts_id'] = $this->validId($input['ts_id'], 'Transport stream ID', false);
             if (isset($input['input_url']))  $ch['input_url']  = $this->normaliseUdp($input['input_url'], true);
             if (isset($input['uplink_url'])) $ch['uplink_url'] = $this->normaliseUdp($input['uplink_url'], false);
             if (isset($input['marker_pid'])) $ch['marker_pid'] = $this->validPid($input['marker_pid']);
@@ -349,6 +368,35 @@ class ChannelService
         return $state !== '' ? $state : 'unknown';
     }
 
+    // ---------------------------------------------------------------- recovery
+
+    // The list the set-top boxes fetch at boot. Only channels whose sender is
+    // actually running are advertised - a box should never be pointed at a
+    // recovery peer that is not listening.
+    public function getRecoveryChannels()
+    {
+        $data = $this->read();
+        $ip   = $data['settings']['server_ip'];
+        $out  = [];
+
+        foreach ($data['channels'] as $ch) {
+            if ((int)($ch['service_id'] ?? 0) === 0) continue;                 // not addressable
+            if ($this->serviceState('ristsender-' . $ch['id']) !== 'active') continue;
+
+            $out[] = [
+                'service_id' => (int)$ch['service_id'],
+                'ts_id'      => (int)($ch['ts_id'] ?? 0),
+                'name'       => $ch['name'],
+                'marker_pid' => (int)$ch['marker_pid'],
+                'rist_url'   => sprintf('rist://%s:%d?buffer=%d',
+                                        $ip,
+                                        (int)$ch['recovery_port'],
+                                        (int)($ch['buffer'] ?? DEFAULT_BUFFER_SIZE)),
+            ];
+        }
+        return $out;
+    }
+
     // ---------------------------------------------------------------- stats
 
     // Reads the channel's librist Prometheus exporter and groups the samples
@@ -449,6 +497,18 @@ class ChannelService
             throw new Exception("Invalid UDP address '{$url}' - expected udp://host:port");
         }
         return 'udp://' . ($listen ? '@' : '') . $body;
+    }
+
+    private function validId($v, $label, $required)
+    {
+        if (is_string($v) && stripos($v, '0x') === 0) $v = hexdec(substr($v, 2));
+        $v = (int)$v;
+        if ($v === 0) {
+            if ($required) throw new Exception("{$label} is required");
+            return 0;
+        }
+        if ($v < 1 || $v > 65535) throw new Exception("{$label} must be between 1 and 65535");
+        return $v;
     }
 
     private function validPid($pid)
