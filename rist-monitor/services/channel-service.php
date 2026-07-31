@@ -73,6 +73,17 @@ class ChannelService
             }
             $data['settings']['server_ip'] = $settings['server_ip'];
         }
+        if (array_key_exists('recovery_ip', $settings)) {
+            $rip = trim((string)$settings['recovery_ip']);
+            if ($rip === '') {
+                unset($data['settings']['recovery_ip']);          // fall back to server_ip
+            } elseif (filter_var($rip, FILTER_VALIDATE_IP)
+                   || preg_match('/^[a-zA-Z0-9][a-zA-Z0-9\.\-]{0,253}$/', $rip)) {
+                $data['settings']['recovery_ip'] = $rip;
+            } else {
+                throw new Exception('Recovery address must be an IP or hostname');
+            }
+        }
         if (isset($settings['buffer']) && is_numeric($settings['buffer'])) {
             $data['settings']['buffer'] = (int)$settings['buffer'];
         }
@@ -376,7 +387,11 @@ class ChannelService
     public function getRecoveryChannels()
     {
         $data = $this->read();
-        $ip   = $data['settings']['server_ip'];
+        // What the boxes are TOLD to connect to. Defaults to this server's own
+        // IP, but can be overridden (different subnet, NAT, or a DNS name).
+        $ip   = !empty($data['settings']['recovery_ip'])
+              ? $data['settings']['recovery_ip']
+              : $data['settings']['server_ip'];
         $out  = [];
 
         foreach ($data['channels'] as $ch) {
