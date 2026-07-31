@@ -86,6 +86,26 @@ require_once __DIR__ . '/config/config.php';
 
 <main>
   <div class="card">
+    <h2>Recovery address</h2>
+    <div class="grid">
+      <div>
+        <label>This server (detected)</label>
+        <input id="s_server" class="mono" readonly>
+        <div class="hint">What the senders bind their peers to</div>
+      </div>
+      <div>
+        <label>Advertised to set-top boxes</label>
+        <input id="s_recovery" class="mono" placeholder="leave blank to use the detected IP">
+        <div class="hint">IP or hostname the API hands out in rist_url</div>
+      </div>
+    </div>
+    <div class="row">
+      <button class="ghost" onclick="saveRecoveryIp()">Save address</button>
+      <span class="hint" id="s_preview"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <h2 id="formTitle">Add channel</h2>
     <div class="grid">
       <div>
@@ -186,6 +206,12 @@ async function load() {
   try {
     const d = await api('GET');
     document.getElementById('srvip').textContent = d.settings.server_ip || '-';
+    document.getElementById('s_server').value = d.settings.server_ip || '';
+    const rip = d.settings.recovery_ip || '';
+    const sr = document.getElementById('s_recovery');
+    if (document.activeElement !== sr) sr.value = rip;
+    document.getElementById('s_preview').textContent =
+      'boxes are told: rist://' + (rip || d.settings.server_ip) + ':<recovery port>';
     const rows = document.getElementById('rows');
 
     if (!d.channels.length) {
@@ -290,6 +316,15 @@ async function del(id, name) {
   try {
     await api('DELETE', '?id=' + encodeURIComponent(id));
     toast('Channel deleted');
+    load();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function saveRecoveryIp() {
+  try {
+    await api('POST', '?action=settings',
+              { recovery_ip: document.getElementById('s_recovery').value });
+    toast('Recovery address saved');
     load();
   } catch (e) { toast(e.message, false); }
 }
