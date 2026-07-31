@@ -349,6 +349,82 @@ class ChannelService
         return $state !== '' ? $state : 'unknown';
     }
 
+    // ---------------------------------------------------------------- stats
+
+    // Reads the channel's librist Prometheus exporter and groups the samples
+    // per peer. The "listening" label tells us which peer a sample belongs to:
+    // the sat_port peer is the satellite path (weight 0), the recovery_port
+    // peer(s) are the receivers pulling recovery (weight 1000).
+    public function getChannelStats($id)
+    {
+        $ch = $this->getChannel($id);
+        if (!$ch) throw new Exception("Channel '{$id}' not found");
+
+        $out = [
+            'channel_id'   => $id,
+            'metrics_port' => (int)$ch['metrics_port'],
+            'available'    => false,
+            'satellite'    => [],
+            'recovery'     => [],
+            'totals'       => ['peers' => 0, 'bandwidth_bps' => 0, 'retransmitted' => 0],
+        ];
+
+        if ($this->serviceState('ristsender-' . $id) !== 'active') return $out;
+
+        $ctx = stream_context_create(['http' => ['timeout' => 2, 'ignore_errors' => true]]);
+        $raw = @file_get_contents('http://127.0.0.1:' . (int)$ch['metrics_port'] . '/metrics', false, $ctx);
+        if ($raw === false || trim($raw) === '') return $out;
+        $out['available'] = true;
+
+        foreach ($this->parsePrometheus($raw) as $peer) {
+            $listening = $peer['listening'] ?? ':0';
+            $port = (int)substr(strrchr($listening, ':'), 1);
+
+            $entry = [
+                'peer_id'       => $peer['peer_id'] ?? '?',
+                'remote'        => $peer['peer_url'] ?? '-',
+                'cname'         => $peer['cname'] ?? '-',
+                'bandwidth_bps' => (float)($peer['rist_sender_peer_bandwidth_bps'] ?? 0),
+                'retry_bps'     => (float)($peer['rist_sender_peer_retry_bandwidth_bps'] ?? 0),
+                'sent'          => (int)($peer['rist_sender_peer_sent_packets'] ?? 0),
+                'retransmitted' => (int)($peer['rist_sender_peer_retransmitted_packets'] ?? 0),
+                'received'      => (int)($peer['rist_sender_peer_received_packets'] ?? 0),
+                'rtt_ms'        => round(((float)($peer['rist_sender_peer_rtt_seconds'] ?? 0)) * 1000, 1),
+                'quality'       => (float)($peer['rist_sender_peer_quality'] ?? 0),
+            ];
+
+            if ($port === (int)$ch['recovery_port']) {
+                $out['recovery'][] = $entry;
+            } else {
+                $out['satellite'][] = $entry;
+            }
+            $out['totals']['peers']++;
+            $out['totals']['bandwidth_bps'] += $entry['bandwidth_bps'];
+            $out['totals']['retransmitted'] += $entry['retransmitted'];
+        }
+
+        return $out;
+    }
+
+    private function parsePrometheus($raw)
+    {
+        $peers = [];
+        foreach (explode("\n", $raw) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] === '#') continue;
+            if (!preg_match('/^([a-zA-Z0-9_]+)\{([^}]*)\}\s+([-0-9.eE+]+)$/', $line, $m)) continue;
+
+            $labels = [];
+            if (preg_match_all('/([a-zA-Z0-9_]+)="([^"]*)"/', $m[2], $lm, PREG_SET_ORDER)) {
+                foreach ($lm as $l) $labels[$l[1]] = $l[2];
+            }
+            $key = ($labels['sender_id'] ?? '0') . ':' . ($labels['peer_id'] ?? '?');
+            if (!isset($peers[$key])) $peers[$key] = $labels;
+            $peers[$key][$m[1]] = $m[3];
+        }
+        return array_values($peers);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private function slug($name)
