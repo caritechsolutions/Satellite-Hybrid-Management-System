@@ -106,6 +106,15 @@ require_once __DIR__ . '/config/config.php';
         <input id="f_pid" class="mono" value="8176">
         <div class="hint">8176 = 0x1FF0 (current tool default)</div>
       </div>
+      <div>
+        <label>Service ID</label>
+        <input id="f_sid" class="mono" placeholder="1000">
+        <div class="hint">How set-top boxes identify this channel &mdash; must be unique</div>
+      </div>
+      <div>
+        <label>Transport stream ID <span style="opacity:.6">(optional)</span></label>
+        <input id="f_tsid" class="mono" placeholder="1">
+      </div>
     </div>
 
     <div class="grid" style="margin-top:14px">
@@ -134,11 +143,11 @@ require_once __DIR__ . '/config/config.php';
     <table>
       <thead>
         <tr>
-          <th>Name</th><th>Input</th><th>Uplink</th><th>Marker PID</th>
+          <th>Name</th><th>Service ID</th><th>Input</th><th>Uplink</th><th>Marker PID</th>
           <th>Ports (sat / rec / metrics)</th><th>Sender</th><th>Marker</th><th></th>
         </tr>
       </thead>
-      <tbody id="rows"><tr><td colspan="8" class="empty">Loading&hellip;</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="9" class="empty">Loading&hellip;</td></tr></tbody>
     </table>
   </div>
 </main>
@@ -180,13 +189,14 @@ async function load() {
     const rows = document.getElementById('rows');
 
     if (!d.channels.length) {
-      rows.innerHTML = '<tr><td colspan="8" class="empty">No channels yet - add one above</td></tr>';
+      rows.innerHTML = '<tr><td colspan="9" class="empty">No channels yet - add one above</td></tr>';
       return;
     }
 
     rows.innerHTML = d.channels.map(c => `
       <tr id="row-${c.id}">
         <td><b>${esc(c.name)}</b><div class="hint mono">${esc(c.id)}</div></td>
+        <td class="mono">${c.service_id || '<span class="hint">not set</span>'}${c.ts_id ? `<div class="hint mono">ts ${c.ts_id}</div>` : ''}</td>
         <td class="mono">${esc(c.input_url)}</td>
         <td class="mono">${esc(c.uplink_url)}</td>
         <td class="mono">${c.marker_pid} <span class="hint">0x${(+c.marker_pid).toString(16).toUpperCase()}</span></td>
@@ -202,14 +212,14 @@ async function load() {
           <button class="mini del" onclick="del('${c.id}','${esc(c.name)}')">Delete</button>
         </td>
       </tr>
-      ${openStats.has(c.id) ? `<tr class="statrow" id="st-${c.id}"><td colspan="8">
+      ${openStats.has(c.id) ? `<tr class="statrow" id="st-${c.id}"><td colspan="9">
            <div class="statwrap" id="sw-${c.id}">Loading stats&hellip;</div></td></tr>` : ''}`).join('');
 
     openStats.forEach(id => loadStats(id));
   } catch (e) {
     toast(e.message, false);
     document.getElementById('rows').innerHTML =
-      `<tr><td colspan="8" class="empty">${esc(e.message)}</td></tr>`;
+      `<tr><td colspan="9" class="empty">${esc(e.message)}</td></tr>`;
   }
 }
 
@@ -224,6 +234,8 @@ async function save() {
     input_url:  document.getElementById('f_input').value,
     uplink_url: document.getElementById('f_uplink').value,
     marker_pid: document.getElementById('f_pid').value,
+    service_id: document.getElementById('f_sid').value,
+    ts_id:      document.getElementById('f_tsid').value || 0,
   };
   try {
     if (editing) {
@@ -245,6 +257,8 @@ function edit(c) {
   document.getElementById('f_input').value  = c.input_url;
   document.getElementById('f_uplink').value = c.uplink_url;
   document.getElementById('f_pid').value    = c.marker_pid;
+  document.getElementById('f_sid').value    = c.service_id || '';
+  document.getElementById('f_tsid').value   = c.ts_id || '';
   document.getElementById('f_sat').value    = c.sat_port;
   document.getElementById('f_rec').value    = c.recovery_port;
   document.getElementById('f_met').value    = c.metrics_port;
@@ -255,7 +269,7 @@ function edit(c) {
 
 function resetForm() {
   editing = null;
-  ['f_name','f_input','f_uplink'].forEach(i => document.getElementById(i).value = '');
+  ['f_name','f_input','f_uplink','f_sid','f_tsid'].forEach(i => document.getElementById(i).value = '');
   document.getElementById('f_pid').value = '8176';
   ['f_sat','f_rec','f_met'].forEach(i => document.getElementById(i).value = 'auto');
   document.getElementById('formTitle').textContent = 'Add channel';
