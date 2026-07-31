@@ -140,11 +140,44 @@ chmod 664 "${WEB_ROOT}"/config/*.json "${WEB_ROOT}"/data/*.json 2>/dev/null || t
 chmod 775 "$LOG_DIR"; chmod 664 "${LOG_DIR}/rist-monitor.log"
 info "owner www-data; config/ and data/ writable"
 
-# The UI manages channels as systemd units - allow www-data to drive them
+# The UI manages channels as systemd units. Rather than granting www-data a
+# broad root cp/rm, a narrow helper installs only ristsender-*/ristmarker-* units.
+say "Installing systemd unit helper"
+cat > /usr/local/sbin/rist-unit <<'HELPER'
+#!/bin/bash
+# rist-unit - install/remove RIST channel systemd units (root helper for the web UI)
+set -e
+ACTION="$1"; NAME="$2"; SRC="$3"
+
+case "$NAME" in
+    ristsender-*|ristmarker-*) ;;
+    *) echo "refusing unit name: $NAME" >&2; exit 1 ;;
+esac
+case "$NAME" in
+    */*|*..*) echo "refusing path traversal: $NAME" >&2; exit 1 ;;
+esac
+
+DEST="/etc/systemd/system/${NAME}.service"
+case "$ACTION" in
+    install)
+        [ -f "$SRC" ] || { echo "source not found: $SRC" >&2; exit 1; }
+        install -m 0644 -o root -g root "$SRC" "$DEST"
+        ;;
+    remove)
+        rm -f "$DEST"
+        ;;
+    *)
+        echo "usage: rist-unit install|remove <unit-name> [source-file]" >&2; exit 1 ;;
+esac
+systemctl daemon-reload
+HELPER
+chmod 755 /usr/local/sbin/rist-unit
+info "helper installed at /usr/local/sbin/rist-unit"
+
 say "Granting systemd control to www-data"
 cat > /etc/sudoers.d/rist-monitor <<'SUDO'
 # Allow the web UI to manage RIST channel services only
-www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start ristsender-*, /usr/bin/systemctl stop ristsender-*, /usr/bin/systemctl restart ristsender-*, /usr/bin/systemctl enable ristsender-*, /usr/bin/systemctl disable ristsender-*, /usr/bin/systemctl is-active ristsender-*, /usr/bin/systemctl start ristmarker-*, /usr/bin/systemctl stop ristmarker-*, /usr/bin/systemctl restart ristmarker-*, /usr/bin/systemctl enable ristmarker-*, /usr/bin/systemctl disable ristmarker-*, /usr/bin/systemctl is-active ristmarker-*, /usr/bin/systemctl daemon-reload
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/rist-unit, /usr/bin/systemctl start ristsender-*, /usr/bin/systemctl stop ristsender-*, /usr/bin/systemctl restart ristsender-*, /usr/bin/systemctl enable ristsender-*, /usr/bin/systemctl disable ristsender-*, /usr/bin/systemctl is-active ristsender-*, /usr/bin/systemctl start ristmarker-*, /usr/bin/systemctl stop ristmarker-*, /usr/bin/systemctl restart ristmarker-*, /usr/bin/systemctl enable ristmarker-*, /usr/bin/systemctl disable ristmarker-*, /usr/bin/systemctl is-active ristmarker-*, /usr/bin/systemctl daemon-reload
 SUDO
 chmod 440 /etc/sudoers.d/rist-monitor
 visudo -cf /etc/sudoers.d/rist-monitor >/dev/null || die "sudoers drop-in invalid"
@@ -159,6 +192,7 @@ server {
     server_name _;
     root ${WEB_ROOT};
     index index.php index.html;
+    charset utf-8;
 
     access_log /var/log/nginx/${SITE_NAME}.access.log;
     error_log  /var/log/nginx/${SITE_NAME}.error.log;
