@@ -56,6 +56,20 @@ require_once __DIR__ . '/config/config.php';
   .inactive{background:rgba(143,160,189,.13);color:var(--dim)}
   .failed{background:rgba(255,107,107,.15);color:var(--bad)}
   .empty{text-align:center;color:var(--dim);padding:26px}
+  .statrow td{background:#0e1626;padding:0}
+  .statwrap{padding:14px 16px}
+  .stath{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim);
+         margin:0 0 8px;font-weight:600}
+  .kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .kpi{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+       padding:9px 14px;min-width:104px}
+  .kpi .v{font-size:16px;font-weight:600;font-family:ui-monospace,Consolas,monospace}
+  .kpi .l{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
+  .peers{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px}
+  .peers th{font-size:10px;padding:0 8px 6px}
+  .peers td{padding:6px 8px;border-bottom:1px solid rgba(36,48,73,.5)}
+  .none{color:var(--dim);font-size:12px;padding:6px 8px}
+  .good{color:var(--accent)} .mid{color:var(--warn)} .bad{color:var(--bad)}
   #toast{position:fixed;right:20px;bottom:20px;padding:11px 17px;border-radius:8px;
          font-size:13px;display:none;max-width:400px}
   .ok{background:rgba(61,220,151,.16);border:1px solid var(--accent);color:var(--accent)}
@@ -134,6 +148,7 @@ require_once __DIR__ . '/config/config.php';
 <script>
 const API = 'api/channels.php';
 let editing = null;
+let openStats = new Set();
 
 function toast(msg, ok = true) {
   const t = document.getElementById('toast');
@@ -170,7 +185,7 @@ async function load() {
     }
 
     rows.innerHTML = d.channels.map(c => `
-      <tr>
+      <tr id="row-${c.id}">
         <td><b>${esc(c.name)}</b><div class="hint mono">${esc(c.id)}</div></td>
         <td class="mono">${esc(c.input_url)}</td>
         <td class="mono">${esc(c.uplink_url)}</td>
@@ -182,10 +197,15 @@ async function load() {
           ${c.status === 'active'
             ? `<button class="mini stop" onclick="ctl('${c.id}','stop')">Stop</button>`
             : `<button class="mini start" onclick="ctl('${c.id}','start')">Start</button>`}
+          <button class="mini ghost" onclick="toggleStats('${c.id}')">${openStats.has(c.id) ? 'Hide' : 'Stats'}</button>
           <button class="mini ghost" onclick='edit(${JSON.stringify(c)})'>Edit</button>
           <button class="mini del" onclick="del('${c.id}','${esc(c.name)}')">Delete</button>
         </td>
-      </tr>`).join('');
+      </tr>
+      ${openStats.has(c.id) ? `<tr class="statrow" id="st-${c.id}"><td colspan="8">
+           <div class="statwrap" id="sw-${c.id}">Loading stats&hellip;</div></td></tr>` : ''}`).join('');
+
+    openStats.forEach(id => loadStats(id));
   } catch (e) {
     toast(e.message, false);
     document.getElementById('rows').innerHTML =
@@ -258,6 +278,62 @@ async function del(id, name) {
     toast('Channel deleted');
     load();
   } catch (e) { toast(e.message, false); }
+}
+
+function toggleStats(id) {
+  if (openStats.has(id)) openStats.delete(id); else openStats.add(id);
+  load();
+}
+
+function fmtBps(v) {
+  v = +v || 0;
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + ' Mbps';
+  if (v >= 1e3) return (v / 1e3).toFixed(0) + ' kbps';
+  return v.toFixed(0) + ' bps';
+}
+
+function qcls(q) { return q >= 99 ? 'good' : (q >= 90 ? 'mid' : 'bad'); }
+
+function peerTable(list, emptyMsg) {
+  if (!list.length) return `<div class="none">${emptyMsg}</div>`;
+  return `<table class="peers">
+    <thead><tr><th>Remote</th><th>CNAME</th><th>Bandwidth</th><th>RTT</th>
+               <th>Quality</th><th>Sent</th><th>Retrans</th></tr></thead>
+    <tbody>${list.map(p => `<tr>
+      <td class="mono">${esc(p.remote)}</td>
+      <td class="mono">${esc(p.cname)}</td>
+      <td class="mono">${fmtBps(p.bandwidth_bps)}</td>
+      <td class="mono">${p.rtt_ms} ms</td>
+      <td class="mono ${qcls(p.quality)}">${p.quality}%</td>
+      <td class="mono">${p.sent}</td>
+      <td class="mono">${p.retransmitted}</td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+async function loadStats(id) {
+  const box = document.getElementById('sw-' + id);
+  if (!box) return;
+  try {
+    const s = await api('GET', '?stats=1&id=' + encodeURIComponent(id));
+    if (!s.available) {
+      box.innerHTML = '<div class="none">No metrics - the sender is not running, '
+                    + 'or nothing has connected to port ' + s.metrics_port + ' yet.</div>';
+      return;
+    }
+    box.innerHTML = `
+      <div class="kpis">
+        <div class="kpi"><div class="v">${s.totals.peers}</div><div class="l">Peers</div></div>
+        <div class="kpi"><div class="v">${fmtBps(s.totals.bandwidth_bps)}</div><div class="l">Bandwidth</div></div>
+        <div class="kpi"><div class="v">${s.recovery.length}</div><div class="l">In recovery</div></div>
+        <div class="kpi"><div class="v">${s.totals.retransmitted}</div><div class="l">Retransmits</div></div>
+      </div>
+      <p class="stath">Satellite path &mdash; weight 0 (feeds the marker &rarr; uplink)</p>
+      ${peerTable(s.satellite, 'No satellite peer connected - is ristmarker running?')}
+      <p class="stath">Recovery path &mdash; weight 1000 (receivers pulling over IP)</p>
+      ${peerTable(s.recovery, 'No receivers connected yet')}`;
+  } catch (e) {
+    box.innerHTML = `<div class="none">${esc(e.message)}</div>`;
+  }
 }
 
 load();
