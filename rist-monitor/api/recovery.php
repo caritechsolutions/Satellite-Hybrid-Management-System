@@ -14,12 +14,23 @@
 require_once dirname(__DIR__) . '/config/config.php';
 require_once dirname(__DIR__) . '/services/channel-service.php';
 
+// Emit locally rather than via jsonResponse() so we can drop the escaped
+// slashes - boxes parse this payload, and rist:\/\/ is needlessly noisy
+// when reading it on a serial console.
+function emit($payload, $status = 200)
+{
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { setCORSHeaders(); exit; }
 
 // Boxes only ever read - reject anything else plainly.
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     setCORSHeaders();
-    errorResponse('Method not allowed', 405);
+    emit(['error' => true, 'message' => 'Method not allowed'], 405);
 }
 
 setCORSHeaders();
@@ -33,15 +44,16 @@ try {
         $want = (int)$_GET['service_id'];
         foreach ($channels as $ch) {
             if ($ch['service_id'] === $want) {
-                jsonResponse($ch);
+                emit($ch);
             }
         }
         // Not configured, or its sender is not running. 404 is the signal for
         // the box to stay on the normal decode path for this service.
-        errorResponse("No RIST recovery for service_id {$want}", 404);
+        emit(['error' => true,
+              'message' => "No RIST recovery for service_id {$want}"], 404);
     }
 
-    jsonResponse([
+    emit([
         'server_time' => date('c'),
         'count'       => count($channels),
         'channels'    => $channels,
@@ -49,5 +61,5 @@ try {
 
 } catch (Exception $e) {
     logMessage('ERROR', 'Recovery API error: ' . $e->getMessage());
-    errorResponse('Internal error', 500);
+    emit(['error' => true, 'message' => 'Internal error'], 500);
 }
