@@ -57,6 +57,10 @@ esac
 
 # ---------------------------------------------------------------- code
 say "Fetching application code"
+# We chown the tree to www-data, so root's git sees "dubious ownership" on
+# re-runs. Whitelist it before any git command touches the repo.
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
+
 BACKUP="$(mktemp -d)"
 if [ -d "${APP_DIR}/.git" ]; then
     for f in $STATE_FILES; do
