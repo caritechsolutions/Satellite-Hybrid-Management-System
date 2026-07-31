@@ -42,8 +42,9 @@ apt-get install -y -qq \
     nginx git curl ca-certificates \
     php-fpm php-cli php-curl php-mbstring php-xml \
     gcc g++ meson ninja-build pkg-config \
-    libmbedtls-dev libcjson-dev libmicrohttpd-dev >/dev/null
-info "web stack + build toolchain installed"
+    libmbedtls-dev libcjson-dev libmicrohttpd-dev \
+    ffmpeg >/dev/null
+info "web stack + build toolchain + ffmpeg installed"
 
 PHP_VER="$(ls /etc/php 2>/dev/null | sort -V | tail -1)"
 [ -n "$PHP_VER" ] || die "no PHP found under /etc/php"
