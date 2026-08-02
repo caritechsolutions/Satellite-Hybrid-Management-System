@@ -80,7 +80,7 @@ require_once __DIR__ . '/config/config.php';
 
 <header>
   <h1>RIST Monitor</h1>
-  <nav><a href="index.php">Dashboard</a><a href="channels.php" class="on">Channels</a></nav>
+  <nav><a href="index.php">Dashboard</a><a href="channels.php" class="on">Channels</a><a href="viewing.php">Viewing</a></nav>
   <div class="server">server ip <b id="srvip">-</b></div>
 </header>
 
