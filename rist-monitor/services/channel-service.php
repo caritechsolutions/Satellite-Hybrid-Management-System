@@ -144,7 +144,7 @@ class ChannelService
             'input_url'      => $this->normaliseUdp($input['input_url'] ?? '', true),
             'uplink_url'     => $this->normaliseUdp($input['uplink_url'] ?? '', false),
             'marker_pid'     => $this->validPid($input['marker_pid'] ?? DEFAULT_MARKER_PID),
-            'buffer'         => (int)($input['buffer'] ?? DEFAULT_BUFFER_SIZE),
+            'buffer'         => $this->validBuffer($input['buffer'] ?? DEFAULT_BUFFER_SIZE),
             'enabled'        => true,
             'created_at'     => date('c'),
         ];
@@ -185,7 +185,7 @@ class ChannelService
             if (isset($input['input_url']))  $ch['input_url']  = $this->normaliseUdp($input['input_url'], true);
             if (isset($input['uplink_url'])) $ch['uplink_url'] = $this->normaliseUdp($input['uplink_url'], false);
             if (isset($input['marker_pid'])) $ch['marker_pid'] = $this->validPid($input['marker_pid']);
-            if (isset($input['buffer']) && is_numeric($input['buffer'])) $ch['buffer'] = (int)$input['buffer'];
+            if (isset($input['buffer'])) $ch['buffer'] = $this->validBuffer($input['buffer']);
             $ch['updated_at'] = date('c');
 
             $updated = $ch;
@@ -512,6 +512,17 @@ class ChannelService
             throw new Exception("Invalid UDP address '{$url}' - expected udp://host:port");
         }
         return 'udp://' . ($listen ? '@' : '') . $body;
+    }
+
+    // The RIST retransmission window, in ms. It is also the live delay, so a
+    // typo here costs either recovery headroom or seconds of latency.
+    private function validBuffer($v)
+    {
+        $v = (int)$v;
+        if ($v < 100 || $v > 60000) {
+            throw new Exception('RIST buffer must be between 100 and 60000 ms');
+        }
+        return $v;
     }
 
     private function validId($v, $label, $required)
