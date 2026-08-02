@@ -1,22 +1,24 @@
 <?php
-// api/recovery.php - Set-top box facing recovery lookup
+// api/recovery.php - Set-top box facing recovery lookup + viewing-stats ingest
 //
-// Fetched by each STB at boot over a DNS name, e.g.
-//     GET http://rist-api.example.com/api/recovery.php
+//   GET  /api/recovery.php                 -> channel list
+//   GET  /api/recovery.php?service_id=N    -> single channel, 404 if none
+//   POST /api/recovery.php                 -> ingest stats body, return channel list + ack_id
 //
-// Returns every channel that currently has RIST recovery available - i.e.
-// configured with a service_id AND whose sender is running right now. A box
-// that finds its service_id here switches to the RIST path on zap; anything
-// absent stays on the normal tuner -> demux -> decode path.
-//
-// Read-only. No side effects. Safe to poll.
+// The POST body is the box's viewing-stats batch (schema 1). We store what we
+// can, then reply with the recovery list AND an ack_id = the highest record id
+// durably written for that box. The box drops id <= ack_id and retries the rest.
+// Omitting ack_id (or 0) means "kept nothing" - the box will resend.
 
 require_once dirname(__DIR__) . '/config/config.php';
 require_once dirname(__DIR__) . '/services/channel-service.php';
 
-// Emit locally rather than via jsonResponse() so we can drop the escaped
-// slashes - boxes parse this payload, and rist:\/\/ is needlessly noisy
-// when reading it on a serial console.
+if (!defined('STATS_DIR'))  define('STATS_DIR',  DATA_DIR . '/stats');
+if (!defined('STATS_LOG'))  define('STATS_LOG',  STATS_DIR . '/views.jsonl');
+if (!defined('STATS_ACKS')) define('STATS_ACKS', STATS_DIR . '/acks.json');
+if (!defined('STATS_RAW'))  define('STATS_RAW',  STATS_DIR . '/last-raw.json');
+
+// Emit locally so we can drop the escaped slashes - boxes parse this payload.
 function emit($payload, $status = 200)
 {
     http_response_code($status);
@@ -25,39 +27,147 @@ function emit($payload, $status = 200)
     exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { setCORSHeaders(); exit; }
+// ---------------------------------------------------------------- stats
 
-// Boxes only ever read - reject anything else plainly.
-if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    setCORSHeaders();
-    emit(['error' => true, 'message' => 'Method not allowed'], 405);
+function stats_dir_ready()
+{
+    if (!is_dir(STATS_DIR)) @mkdir(STATS_DIR, 0775, true);
+    return is_dir(STATS_DIR) && is_writable(STATS_DIR);
 }
 
+function stats_load_acks()
+{
+    $raw = @file_get_contents(STATS_ACKS);
+    $a = $raw ? json_decode($raw, true) : null;
+    return is_array($a) ? $a : [];
+}
+
+function stats_save_acks($acks)
+{
+    @file_put_contents(STATS_ACKS, json_encode($acks, JSON_PRETTY_PRINT), LOCK_EX);
+}
+
+/**
+ * Store a batch. Returns the highest record id durably written for this box,
+ * or 0 if nothing was stored (box will resend).
+ */
+function stats_ingest($body, $raw)
+{
+    if (!stats_dir_ready()) {
+        logMessage('ERROR', 'stats: ' . STATS_DIR . ' not writable - not acking');
+        return 0;
+    }
+
+    // Keep the most recent raw body for schema inspection during bring-up.
+    @file_put_contents(STATS_RAW, $raw);
+
+    $boxId = isset($body['box_id']) ? (string)$body['box_id'] : '';
+    if ($boxId === '') { logMessage('WARNING', 'stats: no box_id'); return 0; }
+
+    $records = isset($body['records']) && is_array($body['records']) ? $body['records'] : [];
+    if (!$records) return 0;   // nothing to ack
+
+    $acks   = stats_load_acks();
+    $lastId = isset($acks[$boxId]) ? (int)$acks[$boxId] : 0;
+
+    // Untrusted unless the box says its clock was synced this boot.
+    $clockOk = !empty($body['clock_synced']);
+    $boxTime = isset($body['box_time']) ? (int)$body['box_time'] : 0;
+
+    $lines = '';
+    $maxId = $lastId;
+    $kept  = 0;
+
+    foreach ($records as $r) {
+        $id = isset($r['id']) ? (int)$r['id'] : 0;
+        if ($id <= 0)      continue;   // malformed
+        if ($id <= $lastId) { $maxId = max($maxId, $id); continue; }  // already have it
+
+        $row = [
+            'box_id'          => $boxId,
+            'id'              => $id,
+            'service_id'      => isset($r['service_id']) ? (int)$r['service_id'] : 0,
+            'ts_id'           => isset($r['ts_id']) ? (int)$r['ts_id'] : 0,
+            'name'            => isset($r['name']) ? (string)$r['name'] : '',
+            'path'            => isset($r['path']) ? (string)$r['path'] : '',
+            'sat_source'      => isset($r['sat_source']) ? (string)$r['sat_source'] : '',
+            'start_uptime_ms' => isset($r['start_uptime_ms']) ? (int)$r['start_uptime_ms'] : 0,
+            'duration_ms'     => isset($r['duration_ms']) ? (int)$r['duration_ms'] : 0,
+            'first_frame_ms'  => isset($r['first_frame_ms']) ? (int)$r['first_frame_ms'] : -1,
+            // Server-applied wall clock - authoritative, unlike box_time.
+            'received_at'     => date('c'),
+            'box_time'        => $boxTime,
+            'clock_synced'    => $clockOk,
+        ];
+        $lines .= json_encode($row, JSON_UNESCAPED_SLASHES) . "\n";
+        $maxId  = max($maxId, $id);
+        $kept++;
+    }
+
+    if ($lines !== '') {
+        if (@file_put_contents(STATS_LOG, $lines, FILE_APPEND | LOCK_EX) === false) {
+            logMessage('ERROR', 'stats: cannot append ' . STATS_LOG . ' - not acking');
+            return 0;   // durability failed: do NOT ack, box retries
+        }
+    }
+
+    if ($maxId > $lastId) {
+        $acks[$boxId] = $maxId;
+        stats_save_acks($acks);
+    }
+
+    $dropped = isset($body['dropped']) ? (int)$body['dropped'] : 0;
+    logMessage('INFO', "stats: box={$boxId} kept={$kept} ack={$maxId}"
+                     . ($dropped ? " box_dropped={$dropped}" : ''));
+
+    return $maxId;
+}
+
+// ---------------------------------------------------------------- request
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { setCORSHeaders(); exit; }
 setCORSHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+if ($method !== 'GET' && $method !== 'POST') {
+    emit(['error' => true, 'message' => 'Method not allowed'], 405);
+}
 
 try {
     $svc      = new ChannelService();
     $channels = $svc->getRecoveryChannels();
 
-    // Optional single lookup: ?service_id=1000
-    if (isset($_GET['service_id'])) {
+    // Single-service lookup (GET only) - 404 tells the box to stay on the
+    // normal decode path for that service.
+    if ($method === 'GET' && isset($_GET['service_id'])) {
         $want = (int)$_GET['service_id'];
         foreach ($channels as $ch) {
-            if ($ch['service_id'] === $want) {
-                emit($ch);
-            }
+            if ($ch['service_id'] === $want) emit($ch);
         }
-        // Not configured, or its sender is not running. 404 is the signal for
-        // the box to stay on the normal decode path for this service.
         emit(['error' => true,
               'message' => "No RIST recovery for service_id {$want}"], 404);
     }
 
-    emit([
+    $ackId = 0;
+    if ($method === 'POST') {
+        $raw  = file_get_contents('php://input');
+        $body = json_decode($raw, true);
+        if (is_array($body)) {
+            $ackId = stats_ingest($body, $raw);
+        } else {
+            // Bad body must NOT cost the box its channel list.
+            logMessage('WARNING', 'stats: unparseable POST body (' . strlen($raw) . ' bytes)');
+        }
+    }
+
+    $out = [
         'server_time' => date('c'),
         'count'       => count($channels),
         'channels'    => $channels,
-    ]);
+    ];
+    if ($method === 'POST') $out['ack_id'] = $ackId;
+
+    emit($out);
 
 } catch (Exception $e) {
     logMessage('ERROR', 'Recovery API error: ' . $e->getMessage());
