@@ -70,6 +70,19 @@ require_once __DIR__ . '/config/config.php';
   .peers td{padding:6px 8px;border-bottom:1px solid rgba(36,48,73,.5)}
   .none{color:var(--dim);font-size:12px;padding:6px 8px}
   .good{color:var(--accent)} .mid{color:var(--warn)} .bad{color:var(--bad)}
+  .anz{margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+  .anz h3{margin:0 0 4px;font-size:13px;font-weight:600}
+  .anz table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
+  .anz th{font-size:10px;padding:0 8px 6px}
+  .anz td{padding:6px 8px;border-bottom:1px solid rgba(36,48,73,.5)}
+  .anz input{width:90px;padding:5px 8px;font-size:12px}
+  .tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:10px;
+       font-weight:600;margin-left:5px}
+  .tpcr{background:rgba(255,180,84,.16);color:var(--warn)}
+  .tpmt{background:rgba(143,160,189,.16);color:var(--dim)}
+  .tmrk{background:rgba(61,220,151,.16);color:var(--accent)}
+  .chk{display:flex;align-items:center;gap:8px;font-size:13px;margin-top:12px}
+  .chk input{width:auto}
   #toast{position:fixed;right:20px;bottom:20px;padding:11px 17px;border-radius:8px;
          font-size:13px;display:none;max-width:400px}
   .ok{background:rgba(61,220,151,.16);border:1px solid var(--accent);color:var(--accent)}
@@ -157,6 +170,20 @@ require_once __DIR__ . '/config/config.php';
       </div>
     </div>
 
+    <div class="anz">
+      <h3>Stream contents &amp; PID mapping</h3>
+      <div class="hint">Read what is actually in the input, then map PIDs if the uplink needs different ones.</div>
+      <label class="chk">
+        <input type="checkbox" id="f_declare">
+        Declare the marker PID in the PMT (so the mux carries it as part of the service)
+      </label>
+      <div class="row" style="margin-top:10px">
+        <button class="ghost" id="anzBtn" onclick="analyse()">Analyse input</button>
+        <span class="hint" id="anzNote"></span>
+      </div>
+      <div id="anzTable"></div>
+    </div>
+
     <div class="row">
       <button class="primary" id="saveBtn" onclick="save()">Create channel</button>
       <button class="ghost" id="cancelBtn" onclick="resetForm()" style="display:none">Cancel</button>
@@ -182,6 +209,8 @@ require_once __DIR__ . '/config/config.php';
 <script>
 const API = 'api/channels.php';
 let editing = null;
+let analysis = null;      // last analyse result for the channel being edited
+let remap = {};           // { fromPid: toPid }
 let openStats = new Set();
 
 function toast(msg, ok = true) {
@@ -260,6 +289,81 @@ function esc(s) {
     ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
 }
 
+function ago(iso) {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime())/1000);
+  if (s < 60)   return Math.round(s) + 's ago';
+  if (s < 3600) return Math.round(s/60) + 'm ago';
+  if (s < 86400)return Math.round(s/3600) + 'h ago';
+  return Math.round(s/86400) + 'd ago';
+}
+
+function fmtRate(b) {
+  b = +b || 0;
+  if (b >= 1e6) return (b/1e6).toFixed(2) + ' Mbps';
+  if (b >= 1e3) return Math.round(b/1e3) + ' kbps';
+  return b ? b + ' bps' : '-';
+}
+
+function renderAnalysis() {
+  const box = document.getElementById('anzTable');
+  if (!analysis || !analysis.streams || !analysis.streams.length) { box.innerHTML = ''; return; }
+
+  const markerPid = parseInt(document.getElementById('f_pid').value || '0', 10);
+
+  box.innerHTML = `<table>
+    <thead><tr><th>PID</th><th>Contents</th><th>Bitrate</th><th>Map to</th></tr></thead>
+    <tbody>${analysis.streams.map(st => {
+      const tags = (st.is_pcr ? '<span class="tag tpcr">PCR</span>' : '')
+                 + (st.is_pmt ? '<span class="tag tpmt">PMT</span>' : '')
+                 + (st.pid === markerPid ? '<span class="tag tmrk">marker</span>' : '');
+      const to = remap[st.pid] ?? '';
+      return `<tr>
+        <td class="mono">0x${st.pid.toString(16).toUpperCase().padStart(4,'0')}
+            <span class="hint">${st.pid}</span></td>
+        <td>${esc(st.description || '-')}${tags}</td>
+        <td class="mono">${fmtRate(st.bitrate)}</td>
+        <td><input class="mono" placeholder="unchanged" value="${to}"
+                   onchange="setRemap(${st.pid}, this.value)"></td>
+      </tr>`;
+    }).join('')}</tbody></table>
+    <div class="hint" style="margin-top:8px">
+      Leave blank to keep a PID as it is. The PMT is rewritten automatically, so the
+      PCR reference follows the video.
+    </div>`;
+}
+
+function setRemap(from, val) {
+  const v = String(val).trim();
+  if (v === '') { delete remap[from]; return; }
+  const n = v.toLowerCase().startsWith('0x') ? parseInt(v, 16) : parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 32 || n > 8190) {
+    toast('PID must be between 32 and 8190', false);
+    renderAnalysis();
+    return;
+  }
+  remap[from] = n;
+}
+
+async function analyse() {
+  if (!editing) { toast('Save the channel first, then analyse its input', false); return; }
+  const btn = document.getElementById('anzBtn');
+  const note = document.getElementById('anzNote');
+  btn.disabled = true; note.textContent = 'Reading the stream…';
+  try {
+    analysis = await api('GET', '?analyse=1&id=' + encodeURIComponent(editing));
+    note.textContent = `service ${analysis.service_id}`
+                     + (analysis.name ? ` "${analysis.name}"` : '')
+                     + ` — ${analysis.streams.length} stream(s)`;
+    renderAnalysis();
+  } catch (e) {
+    note.textContent = '';
+    toast(e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function save() {
   const payload = {
     name:       document.getElementById('f_name').value,
@@ -269,6 +373,8 @@ async function save() {
     service_id: document.getElementById('f_sid').value,
     ts_id:      document.getElementById('f_tsid').value || 0,
     buffer:     document.getElementById('f_buf').value,
+    declare_marker: document.getElementById('f_declare').checked,
+    remap:      remap,
   };
   try {
     if (editing) {
@@ -293,6 +399,12 @@ function edit(c) {
   document.getElementById('f_sid').value    = c.service_id || '';
   document.getElementById('f_tsid').value   = c.ts_id || '';
   document.getElementById('f_buf').value    = c.buffer || 8000;
+  document.getElementById('f_declare').checked = !!c.declare_marker;
+  remap = c.remap || {};
+  analysis = c.analysis || null;
+  document.getElementById('anzNote').textContent =
+    analysis ? 'last analysed ' + ago(analysis.analysed_at) : '';
+  renderAnalysis();
   document.getElementById('f_sat').value    = c.sat_port;
   document.getElementById('f_rec').value    = c.recovery_port;
   document.getElementById('f_met').value    = c.metrics_port;
@@ -306,6 +418,10 @@ function resetForm() {
   ['f_name','f_input','f_uplink','f_sid','f_tsid'].forEach(i => document.getElementById(i).value = '');
   document.getElementById('f_pid').value = '8176';
   document.getElementById('f_buf').value = '8000';
+  document.getElementById('f_declare').checked = false;
+  remap = {}; analysis = null;
+  document.getElementById('anzTable').innerHTML = '';
+  document.getElementById('anzNote').textContent = '';
   ['f_sat','f_rec','f_met'].forEach(i => document.getElementById(i).value = 'auto');
   document.getElementById('formTitle').textContent = 'Add channel';
   document.getElementById('saveBtn').textContent = 'Create channel';
