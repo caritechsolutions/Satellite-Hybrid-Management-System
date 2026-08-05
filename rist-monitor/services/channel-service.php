@@ -202,6 +202,16 @@ class ChannelService
 
         if (!$found) throw new Exception("Channel '{$id}' not found");
 
+        // Backfill any port this record predates, then persist before we build
+        // the units from it.
+        foreach ($data['channels'] as &$c2) {
+            if ($c2['id'] === $id) {
+                $this->ensurePorts($c2, $data['channels']);
+                $updated = $c2;
+            }
+        }
+        unset($c2);
+
         $this->write($data);
         $this->writeUnits($updated, $data['settings']);
 
@@ -251,6 +261,33 @@ class ChannelService
         ];
     }
 
+    // Channels created before a port was introduced have no value for it, and
+    // (int)null is 0 - which silently produces udp://127.0.0.1:0. Backfill any
+    // missing port against the ports already in use.
+    private function ensurePorts(&$ch, $allChannels)
+    {
+        $changed = false;
+        $spec = [
+            'sat_port'      => PORT_BASE_SAT,
+            'recovery_port' => PORT_BASE_RECOVERY,
+            'metrics_port'  => PORT_BASE_METRICS,
+            'tsp_port'      => PORT_BASE_TSP,
+        ];
+        foreach ($spec as $field => $base) {
+            if (!empty($ch[$field])) continue;
+            $used = [];
+            foreach ($allChannels as $other) {
+                if (!empty($other[$field]) && $other['id'] !== $ch['id']) {
+                    $used[] = (int)$other[$field];
+                }
+            }
+            $ch[$field] = $this->nextFree($base, $used);
+            $changed = true;
+            logMessage('INFO', "backfilled {$field}={$ch[$field]} for {$ch['id']}");
+        }
+        return $changed;
+    }
+
     private function nextFree($base, $used)
     {
         for ($p = $base; $p < $base + 100; $p++) {
@@ -294,6 +331,9 @@ class ChannelService
         // Connects to the sender's weight-0 peer and emits the marked TS.
         // With a tsp stage configured it hands off on loopback; otherwise it
         // goes straight to the uplink exactly as before.
+        if ($this->tspNeeded($ch) && empty($ch['tsp_port'])) {
+            throw new Exception("Channel '{$ch['id']}' has no tsp_port allocated");
+        }
         $dest = $this->tspNeeded($ch)
               ? sprintf('udp://127.0.0.1:%d', (int)$ch['tsp_port'])
               : $ch['uplink_url'];
@@ -313,6 +353,9 @@ class ChannelService
     // the PCR reference pointing at the video after it moves.
     public function buildTspCommand($ch, $settings)
     {
+        if (empty($ch['tsp_port'])) {
+            throw new Exception("Channel '{$ch['id']}' has no tsp_port allocated");
+        }
         $stages = '';
 
         if (!empty($ch['declare_marker'])) {
