@@ -261,6 +261,42 @@ chmod 440 /etc/sudoers.d/rist-monitor
 visudo -cf /etc/sudoers.d/rist-monitor >/dev/null || die "sudoers drop-in invalid"
 info "www-data may manage ristsender-* / ristmarker-* units"
 
+# ---------------------------------------------------------------- mcast bridge
+# Internal multicast fabric: 238.0.0.0/8 routed to a member-less bridge, so a
+# stream handed between local processes never touches a physical NIC. TSDuck's
+# "-I ip" rejects a unicast address, so the internal hops need a real group.
+say "Setting up the internal multicast bridge"
+cat > /etc/systemd/system/rist-mcast-bridge.service <<'BRIDGE'
+[Unit]
+Description=Internal multicast bridge for RIST inter-process links
+After=network-pre.target
+Wants=network-pre.target
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip link show br-rist >/dev/null 2>&1 || ip link add name br-rist type bridge'
+ExecStart=/bin/sh -c 'ip link set br-rist up'
+ExecStart=/bin/sh -c 'ip link set br-rist multicast on'
+ExecStart=/bin/sh -c 'ip addr show dev br-rist | grep -q "10.255.255.1/24" || ip addr add 10.255.255.1/24 dev br-rist'
+ExecStart=/bin/sh -c 'ip route show 238.0.0.0/8 2>/dev/null | grep -q br-rist || ip route add 238.0.0.0/8 dev br-rist'
+ExecStop=/bin/sh -c 'ip route del 238.0.0.0/8 dev br-rist 2>/dev/null || true'
+ExecStop=/bin/sh -c 'ip link del br-rist 2>/dev/null || true'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+BRIDGE
+systemctl daemon-reload
+systemctl enable --now rist-mcast-bridge >/dev/null 2>&1 || warn "bridge unit did not start"
+if ip route show 238.0.0.0/8 2>/dev/null | grep -q br-rist; then
+    info "br-rist up, 238.0.0.0/8 routed to it (reserved - do not use elsewhere)"
+else
+    warn "238.0.0.0/8 route not present - the tsp stage will not receive"
+fi
+
 # ---------------------------------------------------------------- nginx
 say "Configuring nginx"
 cat > "/etc/nginx/sites-available/${SITE_NAME}" <<NGINX
