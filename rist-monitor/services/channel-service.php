@@ -17,6 +17,10 @@ if (!defined('PORT_BASE_SAT'))      define('PORT_BASE_SAT', 5600);
 if (!defined('PORT_BASE_RECOVERY')) define('PORT_BASE_RECOVERY', 5700);
 if (!defined('PORT_BASE_METRICS'))  define('PORT_BASE_METRICS', 6000);
 if (!defined('DEFAULT_MARKER_PID')) define('DEFAULT_MARKER_PID', 0x1FF0); // 8176
+if (!defined('PORT_BASE_TSP'))      define('PORT_BASE_TSP', 6300);
+if (!defined('TSP_BINARY'))         define('TSP_BINARY', '/usr/bin/tsp');
+if (!defined('ANALYSE_SECONDS'))    define('ANALYSE_SECONDS', 5);
+if (!defined('STATS_LOCK_DIR'))     define('STATS_LOCK_DIR', sys_get_temp_dir());
 
 class ChannelService
 {
@@ -146,6 +150,8 @@ class ChannelService
             'marker_pid'     => $this->validPid($input['marker_pid'] ?? DEFAULT_MARKER_PID),
             'buffer'         => $this->validBuffer($input['buffer'] ?? DEFAULT_BUFFER_SIZE),
             'enabled'        => true,
+            'declare_marker' => !empty($input['declare_marker']),
+            'remap'          => $this->validRemap($input['remap'] ?? []),
             'created_at'     => date('c'),
         ];
 
@@ -186,6 +192,8 @@ class ChannelService
             if (isset($input['uplink_url'])) $ch['uplink_url'] = $this->normaliseUdp($input['uplink_url'], false);
             if (isset($input['marker_pid'])) $ch['marker_pid'] = $this->validPid($input['marker_pid']);
             if (isset($input['buffer'])) $ch['buffer'] = $this->validBuffer($input['buffer']);
+            if (array_key_exists('remap', $input)) $ch['remap'] = $this->validRemap($input['remap']);
+            if (array_key_exists('declare_marker', $input)) $ch['declare_marker'] = !empty($input['declare_marker']);
             $ch['updated_at'] = date('c');
 
             $updated = $ch;
@@ -228,16 +236,18 @@ class ChannelService
 
     private function allocatePorts($existing)
     {
-        $usedSat = $usedRec = $usedMet = [];
+        $usedSat = $usedRec = $usedMet = $usedTsp = [];
         foreach ($existing as $ch) {
             if (isset($ch['sat_port']))      $usedSat[] = (int)$ch['sat_port'];
             if (isset($ch['recovery_port'])) $usedRec[] = (int)$ch['recovery_port'];
             if (isset($ch['metrics_port']))  $usedMet[] = (int)$ch['metrics_port'];
+            if (isset($ch['tsp_port']))      $usedTsp[] = (int)$ch['tsp_port'];
         }
         return [
             'sat_port'      => $this->nextFree(PORT_BASE_SAT, $usedSat),
             'recovery_port' => $this->nextFree(PORT_BASE_RECOVERY, $usedRec),
             'metrics_port'  => $this->nextFree(PORT_BASE_METRICS, $usedMet),
+            'tsp_port'      => $this->nextFree(PORT_BASE_TSP, $usedTsp),
         ];
     }
 
@@ -273,17 +283,55 @@ class ChannelService
         );
     }
 
+    // True when tsp has anything to do: declare the marker in the PMT, or remap.
+    public function tspNeeded($ch)
+    {
+        return !empty($ch['remap']) || !empty($ch['declare_marker']);
+    }
+
     public function buildMarkerCommand($ch, $settings)
     {
-        // Connects to the sender's weight-0 peer, emits marked TS to the uplink.
-        // The -P marker-pid switch lands when the tool is updated; stored now.
+        // Connects to the sender's weight-0 peer and emits the marked TS.
+        // With a tsp stage configured it hands off on loopback; otherwise it
+        // goes straight to the uplink exactly as before.
+        $dest = $this->tspNeeded($ch)
+              ? sprintf('udp://127.0.0.1:%d', (int)$ch['tsp_port'])
+              : $ch['uplink_url'];
+
         return sprintf(
             '%s -i rist://%s:%d -o %s',
             MARKER_BINARY,
             $settings['server_ip'],
             $ch['sat_port'],
-            $ch['uplink_url']
+            $dest
         );
+    }
+
+    // tsp reads the marker output on loopback and emits the final uplink feed.
+    // Order matters: --add-pid BEFORE remap, so the marker's new PMT entry is
+    // itself remapped. TSDuck rewrites the PSI by default, which is what keeps
+    // the PCR reference pointing at the video after it moves.
+    public function buildTspCommand($ch, $settings)
+    {
+        $stages = '';
+
+        if (!empty($ch['declare_marker'])) {
+            $stages .= sprintf(' -P pmt --service %d --add-pid 0x%04X/0x05',
+                               (int)$ch['service_id'], (int)$ch['marker_pid']);
+        }
+
+        if (!empty($ch['remap'])) {
+            $pairs = [];
+            foreach ($ch['remap'] as $from => $to) {
+                $pairs[] = sprintf('0x%04X=0x%04X', (int)$from, (int)$to);
+            }
+            $stages .= ' -P remap ' . implode(' ', $pairs);
+        }
+
+        $dest = preg_replace('#^udp://#', '', $ch['uplink_url']);
+
+        return sprintf('%s -r -I ip 127.0.0.1:%d%s -O ip %s --ttl 8',
+                       TSP_BINARY, (int)$ch['tsp_port'], $stages, $dest);
     }
 
     private function writeUnits($ch, $settings)
@@ -326,8 +374,34 @@ class ChannelService
         $this->putUnit($sender, $senderUnit);
         $this->putUnit($marker, $markerUnit);
 
+        // The tsp stage hangs off the marker the same way the marker hangs off
+        // the sender, so the whole chain still starts from the sender alone.
+        $tsp = 'ristmarker-' . $id . '-tsp';
+        if ($this->tspNeeded($ch)) {
+            $tspUnit = "[Unit]\n"
+                . "Description=TSDuck PMT/remap stage - {$ch['name']}\n"
+                . "After={$marker}.service\n"
+                . "BindsTo={$marker}.service\n"
+                . "PartOf={$marker}.service\n\n"
+                . "[Service]\n"
+                . "Type=simple\n"
+                . "ExecStart=" . $this->buildTspCommand($ch, $settings) . "\n"
+                . "Restart=always\n"
+                . "RestartSec=3\n"
+                . "StandardOutput=journal\n"
+                . "StandardError=journal\n\n"
+                . "[Install]\n"
+                . "WantedBy={$marker}.service\n";
+            $this->putUnit($tsp, $tspUnit);
+        } else {
+            $this->systemctl('stop', $tsp);
+            $this->systemctl('disable', $tsp);
+            exec('sudo ' . UNIT_HELPER . ' remove ' . escapeshellarg($tsp) . ' 2>&1');
+        }
+
         $this->systemctl('daemon-reload');
         $this->systemctl('enable', $marker);   // so it starts with the sender
+        if ($this->tspNeeded($ch)) $this->systemctl('enable', $tsp);
     }
 
     private function putUnit($unitName, $contents)
@@ -347,7 +421,7 @@ class ChannelService
 
     private function removeUnits($id)
     {
-        foreach (["ristmarker-{$id}", "ristsender-{$id}"] as $svc) {
+        foreach (["ristmarker-{$id}-tsp", "ristmarker-{$id}", "ristsender-{$id}"] as $svc) {
             $this->systemctl('disable', $svc);
             exec('sudo ' . UNIT_HELPER . ' remove ' . escapeshellarg($svc) . ' 2>&1');
         }
@@ -377,6 +451,140 @@ class ChannelService
         exec('sudo ' . SYSTEMCTL_BINARY . ' is-active ' . escapeshellarg($unit) . ' 2>&1', $out, $rc);
         $state = trim(implode('', $out));
         return $state !== '' ? $state : 'unknown';
+    }
+
+    // ---------------------------------------------------------------- analysis
+
+    // Run TSDuck against the channel's INPUT and report what is actually in the
+    // stream. This is what the GUI offers before a remap - hardcoding PIDs works
+    // for one test source and breaks on any real channel.
+    public function analyseInput($id)
+    {
+        $ch = $this->getChannel($id);
+        if (!$ch) throw new Exception("Channel '{$id}' not found");
+        if (!is_executable(TSP_BINARY)) throw new Exception('TSDuck (tsp) is not installed');
+
+        $lock = STATS_LOCK_DIR . "/analyse-{$id}.lock";
+        $fp = @fopen($lock, 'c');
+        if (!$fp || !flock($fp, LOCK_EX | LOCK_NB)) {
+            if ($fp) fclose($fp);
+            throw new Exception('An analysis is already running for this channel');
+        }
+
+        try {
+            $out = sys_get_temp_dir() . "/tsp-analyse-{$id}.json";
+            @unlink($out);
+
+            // -I ip wants host:port with no scheme
+            $src = preg_replace('#^udp://@?#', '', $ch['input_url']);
+
+            // timeout is a hard backstop: tsp on a dead input waits forever
+            $cmd = sprintf(
+                'timeout %d %s -I ip %s -P until --seconds %d '
+              . '-P analyze --json --output-file %s -O drop 2>&1',
+                ANALYSE_SECONDS + 10,
+                escapeshellcmd(TSP_BINARY),
+                escapeshellarg($src),
+                ANALYSE_SECONDS,
+                escapeshellarg($out)
+            );
+            exec($cmd, $lines, $rc);
+
+            if (!is_file($out) || filesize($out) === 0) {
+                throw new Exception('No data from ' . $ch['input_url']
+                    . ' - is the stream running? (' . trim(implode(' ', array_slice($lines, -3))) . ')');
+            }
+
+            $raw = json_decode(file_get_contents($out), true);
+            @unlink($out);
+            if (!is_array($raw)) throw new Exception('Could not parse the TSDuck report');
+
+            $parsed = $this->parseAnalysis($raw);
+            $parsed['analysed_at'] = date('c');
+
+            // Store it so the GUI can later warn that the source changed
+            $data = $this->read();
+            foreach ($data['channels'] as &$c) {
+                if ($c['id'] === $id) $c['analysis'] = $parsed;
+            }
+            unset($c);
+            $this->write($data);
+
+            logMessage('INFO', "analysed {$id}: " . count($parsed['streams']) . ' stream(s)');
+            return $parsed;
+
+        } finally {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+        }
+    }
+
+    // TSDuck's JSON key names vary a little by version, so probe a few spellings
+    // rather than assuming one. Unknown shapes degrade to an empty list instead
+    // of throwing - the raw report is kept so we can tighten this later.
+    private function parseAnalysis($raw)
+    {
+        $pick = function ($arr, $keys, $default = null) {
+            foreach ($keys as $k) {
+                if (is_array($arr) && array_key_exists($k, $arr) && $arr[$k] !== null) return $arr[$k];
+            }
+            return $default;
+        };
+
+        $svcList = $pick($raw, ['services'], []);
+        $svc     = is_array($svcList) && count($svcList) ? reset($svcList) : [];
+
+        $out = [
+            'service_id' => (int)$pick($svc, ['id', 'service-id', 'service_id'], 0),
+            'name'       => (string)$pick($svc, ['name', 'service-name'], ''),
+            'provider'   => (string)$pick($svc, ['provider', 'service-provider'], ''),
+            'pmt_pid'    => (int)$pick($svc, ['pmt-pid', 'pmt_pid'], 0),
+            'pcr_pid'    => (int)$pick($svc, ['pcr-pid', 'pcr_pid'], 0),
+            'ts_id'      => (int)$pick($pick($raw, ['ts'], []), ['id', 'ts-id'], 0),
+            'streams'    => [],
+        ];
+
+        foreach ($pick($raw, ['pids'], []) as $p) {
+            if (!is_array($p)) continue;
+            $pid = (int)$pick($p, ['id', 'pid'], -1);
+            if ($pid < 0) continue;
+
+            // Skip stuffing and the PSI we never remap
+            if ($pid === 0x1FFF || $pid === 0x0000 || $pid === 0x0011 ||
+                $pid === 0x0010 || $pid === 0x0014 || $pid === 0x0001) continue;
+
+            $out['streams'][] = [
+                'pid'         => $pid,
+                'description' => (string)$pick($p, ['description', 'usage'], ''),
+                'bitrate'     => (int)$pick($p, ['bitrate'], 0),
+                'is_pmt'      => ($pid === $out['pmt_pid']),
+                'is_pcr'      => ($pid === $out['pcr_pid']),
+            ];
+        }
+        usort($out['streams'], function ($a, $b) { return $a['pid'] <=> $b['pid']; });
+        return $out;
+    }
+
+    // remap is { "<from-pid>": <to-pid>, ... }
+    private function validRemap($map)
+    {
+        if ($map === null || $map === '') return [];
+        if (is_string($map)) $map = json_decode($map, true);
+        if (!is_array($map)) throw new Exception('Invalid PID remap');
+
+        $clean = [];
+        $seen  = [];
+        foreach ($map as $from => $to) {
+            $f = $this->validPid($from);
+            $t = $this->validPid($to);
+            if ($f === $t) continue;                      // no-op, drop it
+            if (isset($seen[$t])) {
+                throw new Exception("Two PIDs are both remapped to " . $t);
+            }
+            $seen[$t]   = true;
+            $clean[$f]  = $t;
+        }
+        return $clean;
     }
 
     // ---------------------------------------------------------------- recovery
