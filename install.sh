@@ -137,6 +137,69 @@ build_tool ristreceiver_with_markers.c ristreceiver_with_markers "-lrist -lpthre
 build_tool rist_watchdog.c             rist_watchdog             ""
 build_tool ristsender_marker.c         ristsender_marker         "-lrist -lpthread"
 
+# ---------------------------------------------------------------- tsduck
+# TSDuck is used to post-process the marked TS before the uplink: declare the
+# marker PID in the PMT, and remap PIDs. Installed from a prebuilt .deb rather
+# than built from source - no toolchain, no long compile.
+say "Installing TSDuck"
+if command -v tsp >/dev/null 2>&1 && tsp --version >/dev/null 2>&1; then
+    info "already installed: $(tsp --version 2>&1 | head -1)"
+else
+    # A broken install (present but not runnable) is worse than none - clear it
+    if command -v tsp >/dev/null 2>&1; then
+        warn "tsp present but not running - purging before reinstall"
+        dpkg --purge tsduck >/dev/null 2>&1 || true
+    fi
+
+    ARCH="$(dpkg --print-architecture)"
+    . /etc/os-release
+    info "host: ${ARCH} on ${PRETTY_NAME:-unknown}"
+
+    # Ubuntu 24 packages use libssl3t64/libcurl4t64 and will NOT work on older releases
+    case "${VERSION_CODENAME:-}" in
+        noble|plucky|oracular) TSD_VER="3.43-4524"; TSD_TAG="ubuntu24" ;;
+        jammy)                 TSD_VER="3.33-3139"; TSD_TAG="ubuntu22" ;;
+        focal)                 TSD_VER="3.26-2349"; TSD_TAG="ubuntu20" ;;
+        *) warn "unrecognised release - trying the ubuntu24 package"
+           TSD_VER="3.43-4524"; TSD_TAG="ubuntu24" ;;
+    esac
+
+    TSD_DEB=""
+    LOCAL_DEB="$(find "${APP_DIR}/packages" -name "tsduck*${TSD_TAG}*${ARCH}.deb" 2>/dev/null | head -1)"
+    if [ -n "$LOCAL_DEB" ]; then
+        info "using bundled package: $(basename "$LOCAL_DEB")"
+        TSD_DEB="$LOCAL_DEB"
+    else
+        TSD_PKG="tsduck_${TSD_VER}.${TSD_TAG}_${ARCH}.deb"
+        info "no bundled package for ${TSD_TAG}/${ARCH} - downloading ${TSD_VER}"
+        TSD_DEB="/tmp/tsduck.deb"; rm -f "$TSD_DEB"
+        for attempt in 1 2 3; do
+            if curl -fsSL -o "$TSD_DEB" \
+               "https://github.com/tsduck/tsduck/releases/download/v${TSD_VER}/${TSD_PKG}"; then
+                break
+            fi
+            warn "download attempt ${attempt} failed"; sleep 2
+        done
+    fi
+
+    if [ -s "$TSD_DEB" ]; then
+        apt-get install -y -qq libcurl4 libpcsclite1 libedit2 >/dev/null 2>&1 || true
+        dpkg -i "$TSD_DEB" >/dev/null 2>&1 || warn "dpkg reported issues - fixing dependencies"
+        apt-get install -f -y -qq >/dev/null 2>&1 || true
+        [ "$TSD_DEB" = "/tmp/tsduck.deb" ] && rm -f /tmp/tsduck.deb
+    else
+        warn "no TSDuck package available"
+        warn "  download tsduck_${TSD_VER}.${TSD_TAG}_${ARCH}.deb from"
+        warn "  https://github.com/tsduck/tsduck/releases and put it in ${APP_DIR}/packages/"
+    fi
+
+    if command -v tsp >/dev/null 2>&1 && tsp --version >/dev/null 2>&1; then
+        info "installed: $(tsp --version 2>&1 | head -1)"
+    else
+        warn "TSDuck not available - PMT/PID post-processing will not run"
+    fi
+fi
+
 # ---------------------------------------------------------------- dirs/perms
 say "Setting up directories and permissions"
 mkdir -p "${WEB_ROOT}/config" "${WEB_ROOT}/data" "$LOG_DIR"
@@ -246,6 +309,7 @@ if [ "$PORT" = "80" ]; then URL="http://${IP:-<server-ip>}/"; else URL="http://$
 info "web ui   : ${URL}"
 info "code     : ${APP_DIR} (git ${BRANCH})"
 info "binaries : /usr/local/bin/{ristsender,ristreceiver,ristreceiver_with_markers,rist_watchdog}"
+info "tsduck   : $(command -v tsp >/dev/null 2>&1 && tsp --version 2>&1 | head -1 || echo \"not installed\")"
 info "app log  : ${LOG_DIR}/rist-monitor.log"
 info "unit log : journalctl -u ristsender-<channel> -f"
 echo
