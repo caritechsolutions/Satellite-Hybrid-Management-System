@@ -33,6 +33,9 @@ try {
         case 'GET':
             if (isset($_GET['settings'])) {
                 successResponse($svc->getSettings());
+            } elseif (isset($_GET['analyse'])) {
+                if (!$id) errorResponse('id is required to analyse', 400);
+                successResponse($svc->analyseInput($id));
             } elseif (isset($_GET['stats'])) {
                 if (!$id) errorResponse('id is required for stats', 400);
                 successResponse($svc->getChannelStats($id));
