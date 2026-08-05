@@ -18,6 +18,9 @@ if (!defined('PORT_BASE_RECOVERY')) define('PORT_BASE_RECOVERY', 5700);
 if (!defined('PORT_BASE_METRICS'))  define('PORT_BASE_METRICS', 6000);
 if (!defined('DEFAULT_MARKER_PID')) define('DEFAULT_MARKER_PID', 0x1FF0); // 8176
 if (!defined('PORT_BASE_TSP'))      define('PORT_BASE_TSP', 6300);
+// Internal multicast fabric - see rist-mcast-bridge.service. Routed to a
+// member-less bridge so it never reaches a physical NIC.
+if (!defined('INTERNAL_MCAST_PREFIX')) define('INTERNAL_MCAST_PREFIX', '238.0.0.');
 if (!defined('TSP_BINARY'))         define('TSP_BINARY', '/usr/bin/tsp');
 if (!defined('ANALYSE_SECONDS'))    define('ANALYSE_SECONDS', 5);
 if (!defined('STATS_LOCK_DIR'))     define('STATS_LOCK_DIR', sys_get_temp_dir());
@@ -253,11 +256,14 @@ class ChannelService
             if (isset($ch['metrics_port']))  $usedMet[] = (int)$ch['metrics_port'];
             if (isset($ch['tsp_port']))      $usedTsp[] = (int)$ch['tsp_port'];
         }
+        $tspPort = $this->nextFree(PORT_BASE_TSP, $usedTsp);
         return [
             'sat_port'      => $this->nextFree(PORT_BASE_SAT, $usedSat),
             'recovery_port' => $this->nextFree(PORT_BASE_RECOVERY, $usedRec),
             'metrics_port'  => $this->nextFree(PORT_BASE_METRICS, $usedMet),
-            'tsp_port'      => $this->nextFree(PORT_BASE_TSP, $usedTsp),
+            'tsp_port'      => $tspPort,
+            // One group per channel keeps the internal hops independent
+            'internal_addr' => INTERNAL_MCAST_PREFIX . (($tspPort - PORT_BASE_TSP) + 1),
         ];
     }
 
@@ -273,6 +279,11 @@ class ChannelService
             'metrics_port'  => PORT_BASE_METRICS,
             'tsp_port'      => PORT_BASE_TSP,
         ];
+        if (empty($ch['internal_addr']) && !empty($ch['tsp_port'])) {
+            $ch['internal_addr'] = INTERNAL_MCAST_PREFIX
+                                 . ((int)$ch['tsp_port'] - PORT_BASE_TSP + 1);
+            $changed = true;
+        }
         foreach ($spec as $field => $base) {
             if (!empty($ch[$field])) continue;
             $used = [];
@@ -282,10 +293,21 @@ class ChannelService
                 }
             }
             $ch[$field] = $this->nextFree($base, $used);
+            if ($field === 'tsp_port') {
+                $ch['internal_addr'] = INTERNAL_MCAST_PREFIX
+                                     . ($ch[$field] - PORT_BASE_TSP + 1);
+            }
             $changed = true;
             logMessage('INFO', "backfilled {$field}={$ch[$field]} for {$ch['id']}");
         }
         return $changed;
+    }
+
+    private function internalAddr($ch)
+    {
+        if (!empty($ch['internal_addr'])) return $ch['internal_addr'];
+        // Derived rather than stored on very old records
+        return INTERNAL_MCAST_PREFIX . ((int)$ch['tsp_port'] - PORT_BASE_TSP + 1);
     }
 
     private function nextFree($base, $used)
@@ -335,7 +357,7 @@ class ChannelService
             throw new Exception("Channel '{$ch['id']}' has no tsp_port allocated");
         }
         $dest = $this->tspNeeded($ch)
-              ? sprintf('udp://127.0.0.1:%d', (int)$ch['tsp_port'])
+              ? sprintf('udp://%s:%d', $this->internalAddr($ch), (int)$ch['tsp_port'])
               : $ch['uplink_url'];
 
         return sprintf(
@@ -359,8 +381,20 @@ class ChannelService
         $stages = '';
 
         if (!empty($ch['declare_marker'])) {
+            // IMPORTANT: this is the service id in OUR pre-mux stream, which is
+            // NOT the channel's service_id - that one is the STB's lookup key,
+            // i.e. what the box sees on satellite AFTER the uplink mux remaps.
+            // The analysis is the only place the real value is known.
+            $srcSvc = isset($ch['analysis']['service_id']) ? (int)$ch['analysis']['service_id'] : 0;
+            if ($srcSvc <= 0) {
+                throw new Exception(
+                    'Analyse the input first - the PMT stage needs the service id '
+                  . 'present in the source stream, which is not the same as the '
+                  . 'service id the set-top boxes look up.'
+                );
+            }
             $stages .= sprintf(' -P pmt --service %d --add-pid 0x%04X/0x05',
-                               (int)$ch['service_id'], (int)$ch['marker_pid']);
+                               $srcSvc, (int)$ch['marker_pid']);
         }
 
         if (!empty($ch['remap'])) {
@@ -373,8 +407,13 @@ class ChannelService
 
         $dest = preg_replace('#^udp://#', '', $ch['uplink_url']);
 
-        return sprintf('%s -r -I ip 127.0.0.1:%d%s -O ip %s --ttl 8',
-                       TSP_BINARY, (int)$ch['tsp_port'], $stages, $dest);
+        // -I ip requires a real MULTICAST group ("address 127.0.0.1:6300 is not
+        // multicast"). The internal 238.0.0.0/8 fabric is routed to a member-less
+        // bridge, so this group never reaches a physical NIC. ttl 1 on the way in
+        // for the same reason; the uplink output keeps a routable ttl.
+        return sprintf('%s -r -I ip %s:%d%s -O ip %s --ttl 8',
+                       TSP_BINARY, $this->internalAddr($ch), (int)$ch['tsp_port'],
+                       $stages, $dest);
     }
 
     private function writeUnits($ch, $settings)
@@ -401,7 +440,8 @@ class ChannelService
         // starting/stopping/restarting the sender does the same to the marker.
         $markerUnit = "[Unit]\n"
             . "Description=RIST Marker Receiver - {$ch['name']}\n"
-            . "After={$sender}.service\n"
+            . "After={$sender}.service rist-mcast-bridge.service\n"
+            . "Requires=rist-mcast-bridge.service\n"
             . "BindsTo={$sender}.service\n"
             . "PartOf={$sender}.service\n\n"
             . "[Service]\n"
@@ -423,7 +463,8 @@ class ChannelService
         if ($this->tspNeeded($ch)) {
             $tspUnit = "[Unit]\n"
                 . "Description=TSDuck PMT/remap stage - {$ch['name']}\n"
-                . "After={$marker}.service\n"
+                . "After={$marker}.service rist-mcast-bridge.service\n"
+                . "Requires=rist-mcast-bridge.service\n"
                 . "BindsTo={$marker}.service\n"
                 . "PartOf={$marker}.service\n\n"
                 . "[Service]\n"
