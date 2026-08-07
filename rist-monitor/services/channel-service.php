@@ -159,6 +159,7 @@ class ChannelService
             'buffer'         => $this->validBuffer($input['buffer'] ?? DEFAULT_BUFFER_SIZE),
             'enabled'        => true,
             'declare_marker' => !empty($input['declare_marker']),
+            'out_service_id' => $this->validOutSvc($input['out_service_id'] ?? 0),
             'remap'          => $this->validRemap($input['remap'] ?? []),
             'created_at'     => date('c'),
         ];
@@ -202,6 +203,7 @@ class ChannelService
             if (isset($input['buffer'])) $ch['buffer'] = $this->validBuffer($input['buffer']);
             if (array_key_exists('remap', $input)) $ch['remap'] = $this->validRemap($input['remap']);
             if (array_key_exists('declare_marker', $input)) $ch['declare_marker'] = !empty($input['declare_marker']);
+            if (array_key_exists('out_service_id', $input)) $ch['out_service_id'] = $this->validOutSvc($input['out_service_id']);
             $ch['updated_at'] = date('c');
 
             $updated = $ch;
@@ -350,7 +352,8 @@ class ChannelService
     // True when tsp has anything to do: declare the marker in the PMT, or remap.
     public function tspNeeded($ch)
     {
-        return !empty($ch['remap']) || !empty($ch['declare_marker']);
+        return !empty($ch['remap']) || !empty($ch['declare_marker'])
+            || !empty($ch['out_service_id']);
     }
 
     public function buildMarkerCommand($ch, $settings)
@@ -408,6 +411,23 @@ class ChannelService
                 $pairs[] = sprintf('0x%04X=0x%04X', (int)$from, (int)$to);
             }
             $stages .= ' -P remap ' . implode(' ', $pairs);
+        }
+
+        // Renaming the service must come AFTER the pmt stage, which selects the
+        // service by its SOURCE id - rename first and pmt would no longer match.
+        // remap works on PIDs and is unaffected either way.
+        if (!empty($ch['out_service_id'])) {
+            $srcSvc = isset($ch['analysis']['service_id']) ? (int)$ch['analysis']['service_id'] : 0;
+            if ($srcSvc <= 0) {
+                throw new Exception(
+                    'Analyse the input first - renaming the service needs the id '
+                  . 'present in the source stream.'
+                );
+            }
+            if ($srcSvc !== (int)$ch['out_service_id']) {
+                $stages .= sprintf(' -P svrename --id %d --new-id %d',
+                                   $srcSvc, (int)$ch['out_service_id']);
+            }
         }
 
         $dest = preg_replace('#^udp://#', '', $ch['uplink_url']);
@@ -817,6 +837,18 @@ class ChannelService
 
     // The RIST retransmission window, in ms. It is also the live delay, so a
     // typo here costs either recovery headroom or seconds of latency.
+    // The service id to present to the uplink mux. 0 / blank = leave unchanged.
+    private function validOutSvc($v)
+    {
+        if ($v === '' || $v === null) return 0;
+        $v = (int)$v;
+        if ($v === 0) return 0;
+        if ($v < 1 || $v > 65535) {
+            throw new Exception('Uplink service ID must be between 1 and 65535');
+        }
+        return $v;
+    }
+
     private function validBuffer($v)
     {
         $v = (int)$v;
