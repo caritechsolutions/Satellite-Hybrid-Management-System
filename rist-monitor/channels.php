@@ -177,6 +177,10 @@ require_once __DIR__ . '/config/config.php';
         <input type="checkbox" id="f_declare">
         Declare the marker PID in the PMT (so the mux carries it as part of the service)
       </label>
+      <div class="hint" style="margin-top:6px">
+        Uses the service id found in the <em>source</em> stream &mdash; not the Service ID
+        above, which is what the boxes look up after the uplink mux remaps it. Analyse first.
+      </div>
       <div class="row" style="margin-top:10px">
         <button class="ghost" id="anzBtn" onclick="analyse()">Analyse input</button>
         <span class="hint" id="anzNote"></span>
@@ -400,7 +404,11 @@ function edit(c) {
   document.getElementById('f_tsid').value   = c.ts_id || '';
   document.getElementById('f_buf').value    = c.buffer || 8000;
   document.getElementById('f_declare').checked = !!c.declare_marker;
-  remap = c.remap || {};
+  // The API may hand back [] for "no mappings"; assigning a numeric key to an
+  // array creates a sparse one, so normalise to a plain object first.
+  remap = {};
+  const rm = c.remap || {};
+  Object.keys(rm).forEach(k => { if (rm[k] != null && rm[k] !== '') remap[k] = rm[k]; });
   analysis = c.analysis || null;
   document.getElementById('anzNote').textContent =
     analysis ? 'last analysed ' + ago(analysis.analysed_at) : '';
