@@ -106,6 +106,10 @@ class ChannelService
         foreach ($data['channels'] as &$ch) {
             $ch['status'] = $this->serviceState('ristsender-' . $ch['id']);
             $ch['marker_status'] = $this->serviceState('ristmarker-' . $ch['id']);
+            // json_encode turns an empty PHP array into [] - a JSON ARRAY. The
+            // browser then treats remap as an array and a numeric assignment
+            // creates a sparse one full of nulls. Force an object.
+            $ch['remap'] = (object)(isset($ch['remap']) ? $ch['remap'] : []);
         }
         return $data['channels'];
     }
@@ -116,6 +120,7 @@ class ChannelService
             if ($ch['id'] === $id) {
                 $ch['status'] = $this->serviceState('ristsender-' . $id);
                 $ch['marker_status'] = $this->serviceState('ristmarker-' . $id);
+                $ch['remap'] = (object)(isset($ch['remap']) ? $ch['remap'] : []);
                 return $ch;
             }
         }
@@ -659,11 +664,15 @@ class ChannelService
         $clean = [];
         $seen  = [];
         foreach ($map as $from => $to) {
-            $f = $this->validPid($from);
-            $t = $this->validPid($to);
+            // A sparse JS array arrives as a long run of nulls - ignore the holes
+            // rather than failing the whole save on them.
+            if ($to === null || $to === '' || $to === false) continue;
+
+            $f = $this->validPid($from, "Source PID {$from}");
+            $t = $this->validPid($to,   "Target PID for 0x" . strtoupper(dechex((int)$from)));
             if ($f === $t) continue;                      // no-op, drop it
             if (isset($seen[$t])) {
-                throw new Exception("Two PIDs are both remapped to " . $t);
+                throw new Exception(sprintf('Two PIDs are both mapped to 0x%04X (%d)', $t, $t));
             }
             $seen[$t]   = true;
             $clean[$f]  = $t;
@@ -829,12 +838,12 @@ class ChannelService
         return $v;
     }
 
-    private function validPid($pid)
+    private function validPid($pid, $label = 'Marker PID')
     {
         if (is_string($pid) && stripos($pid, '0x') === 0) $pid = hexdec(substr($pid, 2));
         $pid = (int)$pid;
         if ($pid < 0x0020 || $pid > 0x1FFE) {
-            throw new Exception('Marker PID must be between 32 (0x0020) and 8190 (0x1FFE)');
+            throw new Exception($label . ' must be between 32 (0x0020) and 8190 (0x1FFE)');
         }
         return $pid;
     }
