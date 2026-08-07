@@ -149,6 +149,11 @@ require_once __DIR__ . '/config/config.php';
         <input id="f_tsid" class="mono" placeholder="1">
       </div>
       <div>
+        <label>Uplink service ID <span style="opacity:.6">(optional)</span></label>
+        <input id="f_outsvc" class="mono" placeholder="unchanged">
+        <div class="hint">Present a different program number to the mux. Blank = leave as the source.</div>
+      </div>
+      <div>
         <label>RIST buffer (ms)</label>
         <input id="f_buf" class="mono" value="8000">
         <div class="hint">Retransmission window &mdash; also the live delay. Lower = faster zap.</div>
@@ -378,6 +383,7 @@ async function save() {
     ts_id:      document.getElementById('f_tsid').value || 0,
     buffer:     document.getElementById('f_buf').value,
     declare_marker: document.getElementById('f_declare').checked,
+    out_service_id: document.getElementById('f_outsvc').value,
     remap:      remap,
   };
   try {
@@ -404,6 +410,7 @@ function edit(c) {
   document.getElementById('f_tsid').value   = c.ts_id || '';
   document.getElementById('f_buf').value    = c.buffer || 8000;
   document.getElementById('f_declare').checked = !!c.declare_marker;
+  document.getElementById('f_outsvc').value = c.out_service_id || '';
   // The API may hand back [] for "no mappings"; assigning a numeric key to an
   // array creates a sparse one, so normalise to a plain object first.
   remap = {};
@@ -427,6 +434,7 @@ function resetForm() {
   document.getElementById('f_pid').value = '8176';
   document.getElementById('f_buf').value = '8000';
   document.getElementById('f_declare').checked = false;
+  document.getElementById('f_outsvc').value = '';
   remap = {}; analysis = null;
   document.getElementById('anzTable').innerHTML = '';
   document.getElementById('anzNote').textContent = '';
