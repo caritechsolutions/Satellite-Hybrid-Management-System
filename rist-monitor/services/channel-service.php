@@ -425,7 +425,9 @@ class ChannelService
                 );
             }
             if ($srcSvc !== (int)$ch['out_service_id']) {
-                $stages .= sprintf(' -P svrename --id %d --new-id %d',
+                // The service to rename is POSITIONAL; --id gives the NEW id.
+                // (Not "--id <old> --new-id <new>" - there is no --new-id.)
+                $stages .= sprintf(' -P svrename %d --id %d',
                                    $srcSvc, (int)$ch['out_service_id']);
             }
         }
