@@ -145,6 +145,12 @@ build_tool headend_part7_sender.c      headend_part7_sender      "-lrist -lpthre
 build_tool rist_watchdog.c             rist_watchdog             ""
 build_tool ristsender_marker.c         ristsender_marker         "-lrist -lpthread"
 
+# STB-side Part 7 receiver: validates the markers headend_part7_sender inserts,
+# counting elementary streams only and rebuilding each block to 35 packets. This
+# runs on the BOX (ARM) -- built here only so a compile break is caught on the
+# headend; the shipping binary comes from the ARM cross-build.
+build_tool stb_part7_receiver.c        stb_part7_receiver        "-lrist -lpthread"
+
 # ---------------------------------------------------------------- tsduck
 # TSDuck is used to post-process the marked TS before the uplink: declare the
 # marker PID in the PMT, and remap PIDs. Installed from a prebuilt .deb rather
