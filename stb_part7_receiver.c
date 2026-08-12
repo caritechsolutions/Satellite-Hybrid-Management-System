@@ -88,7 +88,7 @@
 #include <time.h>
 
 #define RIST_MARK_UNUSED(unused_param) ((void)(unused_param))
-#define RISTSENDER_VERSION "36-SimpleRecovery"
+#define RISTSENDER_VERSION "37-RcvbufDrainSilence"
 #define MAX_INPUT_COUNT 20
 #define MAX_OUTPUT_COUNT 20
 
@@ -97,7 +97,12 @@
 #define TS_PACKETS_PER_RTP 7
 #define MARKER_PID 0x1FF0
 #define MAX_BLOCK_RTP_PAYLOADS 200
-#define MAX_BLOCK_TS_PACKETS (MAX_BLOCK_RTP_PAYLOADS * TS_PACKET_SIZE)
+/* Packets, not bytes. This was MAX_BLOCK_RTP_PAYLOADS * TS_PACKET_SIZE, which
+ * multiplied by the packet SIZE where it meant packets-per-payload: 37,600
+ * instead of 1,400. The buffer is allocated as this * TS_PACKET_SIZE, so the
+ * box was reserving 6.7 MB of its 128 MB per callback object, and the overflow
+ * guard in buffer_ts_packet() could never trip. */
+#define MAX_BLOCK_TS_PACKETS (MAX_BLOCK_RTP_PAYLOADS * TS_PACKETS_PER_RTP)
 
 #define PACKET_INTERVAL_US 5560ULL
 #define STATUS_UPDATE_INTERVAL_US 5000000ULL  // 5 seconds
@@ -120,6 +125,22 @@
 #define BREAKER_FAIL_RATIO      0.50          /* trip above 50% failing */
 #define BREAKER_RING            512           /* rolling outcome history */
 
+/* Marker-silence timeout. The ratio breaker measures QUALITY: it needs blocks
+ * to judge, so total silence gives it a zero denominator and it can never trip.
+ * Losing the feed entirely is a different failure and needs its own detector.
+ *
+ * Key on markers, not datagrams: the box's own capture keeps injecting PAT+PMT
+ * on a 100ms timer, so datagrams keep arriving with the RF disconnected and any
+ * datagram-liveness test stays green. Markers are the only signal that actually
+ * tracks the feed -- and keying on them also covers the headend's marker tool
+ * dying with RF perfectly healthy, which a tuner-lock test would miss.
+ *
+ * 400ms is ~12 missed markers at the observed ~32ms cadence, comfortably above
+ * the isolated single-marker losses seen in normal operation, and only 5% of the
+ * 8s downstream buffer -- so FSR has most of the buffer left to take over. */
+#define MARKER_SILENCE_TIMEOUT_US 400000ULL
+#define EXIT_MARKER_SILENCE 3
+
 #define CONSECUTIVE_MARKER_LOSS_THRESHOLD 10
 #define VALIDATION_FAILURE_THRESHOLD 10
 #define VALIDATION_FAILURE_WINDOW_US 10000000ULL  // 10 seconds
@@ -135,7 +156,8 @@ static struct rist_logging_settings logging_settings = LOGGING_SETTINGS_INITIALI
 enum circuit_state {
     STATE_NORMAL,      // Normal operation
     STATE_SHUTDOWN,    // Catastrophic failure, discarding everything
-    STATE_RECOVERY     // Validating recovery
+    STATE_RECOVERY,    // Validating recovery
+    STATE_NO_SIGNAL    // Marker silence: the feed is gone, not merely degraded
 };
 
 struct rist_ctx_wrap {
@@ -218,7 +240,19 @@ struct rist_callback_object {
     uint64_t rtp_packets_sent;
     uint64_t dropped_time_held_us;
     uint64_t resync_count;
-    
+
+    /* Datagrams and TS packets actually taken off the input socket. Diff the
+     * per-window datagram delta against the capture's own "sent=" over the same
+     * wall clock: any shortfall is loss on the UDP hop, which is the only path
+     * that can lose in whole 7-packet units. Without this the loss is only
+     * visible downstream as "es=22 (expected 29)", which does not say where. */
+    uint64_t datagrams_received;
+    uint64_t ts_packets_received;
+    uint64_t datagrams_last_status;
+
+    // Marker liveness (see MARKER_SILENCE_TIMEOUT_US)
+    uint64_t last_marker_time_us;
+
     // Periodic status tracking
     uint64_t last_status_time;
     uint64_t markers_last_status;
@@ -571,9 +605,11 @@ static void print_periodic_status(struct rist_callback_object *cb) {
         case STATE_NORMAL: state_str = "NORMAL"; break;
         case STATE_SHUTDOWN: state_str = "SHUTDOWN"; break;
         case STATE_RECOVERY: state_str = "RECOVERY"; break;
+        case STATE_NO_SIGNAL: state_str = "NO_SIGNAL"; break;
     }
-    
+
     uint64_t markers_delta = cb->markers_processed - cb->markers_last_status;
+    uint64_t dgram_delta   = cb->datagrams_received - cb->datagrams_last_status;
     uint64_t sent_delta = cb->blocks_sent - cb->blocks_sent_last_status;
     uint64_t dropped_delta = cb->blocks_dropped - cb->blocks_dropped_last_status;
     uint64_t total_delta = sent_delta + dropped_delta;
@@ -584,14 +620,18 @@ static void print_periodic_status(struct rist_callback_object *cb) {
     }
     
     rist_log(&logging_settings, RIST_LOG_INFO,
-             "[Status] state=%s markers=%llu (lost=%llu) blocks: sent=%llu dropped=%llu (%.1f%%) breaker_trips=%llu\n",
+             "[Status] state=%s markers=%llu (lost=%llu) blocks: sent=%llu dropped=%llu (%.1f%%)"
+             " breaker_trips=%llu udp: dgrams=%llu (total=%llu pkts=%llu)\n",
              state_str,
              (unsigned long long)markers_delta,
              (unsigned long long)cb->markers_lost,
              (unsigned long long)sent_delta,
              (unsigned long long)dropped_delta,
              loss_percent,
-             (unsigned long long)cb->circuit_breaker_trips);
+             (unsigned long long)cb->circuit_breaker_trips,
+             (unsigned long long)dgram_delta,
+             (unsigned long long)cb->datagrams_received,
+             (unsigned long long)cb->ts_packets_received);
     
     if (cb->circuit_state == STATE_RECOVERY) {
         uint64_t recovery_elapsed = (now - cb->recovery_start_time) / 1000000ULL;
@@ -605,6 +645,60 @@ static void print_periodic_status(struct rist_callback_object *cb) {
     cb->markers_last_status = cb->markers_processed;
     cb->blocks_sent_last_status = cb->blocks_sent;
     cb->blocks_dropped_last_status = cb->blocks_dropped;
+    cb->datagrams_last_status = cb->datagrams_received;
+}
+
+/* Marker silence => the feed is gone. Exit, so the RIST sender context dies with
+ * the process and the satellite peer goes genuinely dead downstream.
+ *
+ * Exiting rather than pausing internally is the whole point. librist's peer-death
+ * test counts ANY packet, including RTCP keepalives, so a process that merely
+ * stops emitting data keeps its peer alive -- observed on hardware as
+ * "received=0, dead=NO, time_since_pkt=20ms". FSR activation is gated on
+ * !sat_peer, so a peer that never dies means FSR never engages, which is exactly
+ * the bug. Only tearing the context down produces a dead peer.
+ *
+ * The watchdog restarts us into wait-for-first-marker, where rist_start() is
+ * only reached inside "if (!cb->first_marker_seen)". So the restarted process
+ * emits nothing and the peer STAYS dead until markers actually return. */
+static void check_marker_silence(struct rist_callback_object *cb) {
+    uint64_t now, silent_us;
+
+    /* Only once synchronised: before the first marker there is nothing to have
+     * lost, and tripping during startup would fight the watchdog. */
+    if (!cb->first_marker_seen || cb->last_marker_time_us == 0)
+        return;
+    if (cb->circuit_state == STATE_NO_SIGNAL)
+        return;
+
+    now = get_timestamp_us();
+    if (now < cb->last_marker_time_us)
+        return;                         /* clock went backwards; wait it out */
+
+    silent_us = now - cb->last_marker_time_us;
+    if (silent_us < MARKER_SILENCE_TIMEOUT_US)
+        return;
+
+    cb->circuit_state = STATE_NO_SIGNAL;
+
+    /* Report datagrams too: if those are still climbing while markers stopped,
+     * the input socket is healthy and the FEED is gone -- which distinguishes
+     * this from the socket-overrun loss that shows up as short blocks. */
+    rist_log(&logging_settings, RIST_LOG_ERROR,
+             "\n!!! NO SIGNAL !!!\nNo marker for %llu ms (threshold %llu ms) after %llu markers.\n"
+             "udp still flowing: dgrams=%llu pkts=%llu (PSI injection continues with no feed)\n"
+             "The ratio breaker cannot see this -- no blocks means no denominator.\n"
+             "Exiting so the satellite peer dies and FSR can take over; the watchdog\n"
+             "will restart us into wait-for-first-marker.\n\n",
+             (unsigned long long)(silent_us / 1000ULL),
+             (unsigned long long)(MARKER_SILENCE_TIMEOUT_US / 1000ULL),
+             (unsigned long long)cb->markers_processed,
+             (unsigned long long)cb->datagrams_received,
+             (unsigned long long)cb->ts_packets_received);
+
+    fflush(stdout);
+    fflush(stderr);
+    exit(EXIT_MARKER_SILENCE);
 }
 
 // Rebuild the block to exactly BLOCK_CONTENT_PACKETS before emitting.
@@ -724,6 +818,7 @@ static void process_marker(struct rist_callback_object *cb, const uint8_t *marke
     }
 
     cb->markers_processed++;
+    cb->last_marker_time_us = get_timestamp_us();   /* liveness, see check_marker_silence */
 
     // Handle different circuit breaker states
     if (cb->circuit_state == STATE_SHUTDOWN) {
@@ -994,8 +1089,25 @@ static void input_udp_recv(struct evsocket_ctx *evctx, int fd, short revents, vo
     struct sockaddr_in6 addr6 = {0};
     uint8_t *recv_buf = cb->recv;
     socklen_t addrlen = 0;
+    unsigned drained = 0;
 
     uint16_t address_family = (uint16_t)cb->udp_config->address_family;
+
+    /* Drain everything pending, not one datagram per readiness event.
+     *
+     * The socket is where our loss happens: whole 1316-byte datagrams are
+     * discarded when it overflows, which is the only path that can lose in
+     * exact multiples of 7 TS packets. Everything below this point -- block
+     * reconstruction, the paced emit, logging -- runs on this thread, so any
+     * time spent there is time the socket is filling. Draining one datagram per
+     * poll() meant a backlog took as many poll/recv round trips to clear as it
+     * had datagrams, and the capture can hand us up to 36 at once (it reads
+     * 188*256 bytes per demux read and sends them back to back).
+     *
+     * DRAIN_MAX bounds the loop so a sustained overrun cannot starve the rest
+     * of the event loop -- including the marker-silence check. */
+    #define DRAIN_MAX 256
+    while (drained < DRAIN_MAX) {
     if (address_family == AF_INET6) {
         addrlen = sizeof(struct sockaddr_in6);
         recv_bufsize = udpsocket_recvfrom(cb->sd, recv_buf, sizeof(cb->recv), MSG_DONTWAIT, (struct sockaddr *) &addr6, &addrlen);
@@ -1006,6 +1118,9 @@ static void input_udp_recv(struct evsocket_ctx *evctx, int fd, short revents, vo
 
     if (recv_bufsize > 0) {
         int offset = 0;
+
+        drained++;
+        cb->datagrams_received++;
 
         while (offset + TS_PACKET_SIZE <= recv_bufsize) {
             uint8_t *ts_packet = &recv_buf[offset];
@@ -1035,6 +1150,7 @@ static void input_udp_recv(struct evsocket_ctx *evctx, int fd, short revents, vo
                 }
             }
 
+            cb->ts_packets_received++;
             offset += TS_PACKET_SIZE;
         }
     } else {
@@ -1042,9 +1158,17 @@ static void input_udp_recv(struct evsocket_ctx *evctx, int fd, short revents, vo
             rist_log(&logging_settings, RIST_LOG_ERROR,
                      "Input receive failed: errno=%d\n", errno);
         }
+        break;                          /* socket drained (or a real error) */
     }
-    
-    print_periodic_status(cb);
+    }
+    #undef DRAIN_MAX
+
+    /* print_periodic_status() used to be called here, once per datagram. It is
+     * a blocking write to a serial console shared with every other process on
+     * the box, on the same thread that has to get back to recvfrom(). It now
+     * runs from input_loop(), which also reaches it when no datagrams arrive at
+     * all -- so the status line keeps coming during a signal loss instead of
+     * going quiet exactly when it is most wanted. */
 }
 
 static void input_udp_sockerr(struct evsocket_ctx *evctx, int fd, short revents, void *arg)
@@ -1163,6 +1287,14 @@ static void *input_loop(void *arg)
         else
         {
             evsocket_loop_single(cb->evctx, 5, 100);
+
+            /* Off the per-datagram path deliberately. This branch runs every
+             * ~5ms whether or not anything arrived, which is what the silence
+             * check needs: with the RF pulled, datagrams keep coming (the
+             * capture's own PSI injection) but markers stop, and with the feed
+             * fully gone neither arrives. Both cases are covered from here. */
+            check_marker_silence(cb);
+            print_periodic_status(cb);
         }
     }
     return 0;
@@ -1238,8 +1370,9 @@ static void print_statistics(struct rist_callback_object *cb) {
         case STATE_NORMAL: state_str = "NORMAL"; break;
         case STATE_SHUTDOWN: state_str = "SHUTDOWN"; break;
         case STATE_RECOVERY: state_str = "RECOVERY"; break;
+        case STATE_NO_SIGNAL: state_str = "NO_SIGNAL"; break;
     }
-    
+
     rist_log(&logging_settings, RIST_LOG_INFO,
              "\n=== Final Statistics ===\n");
     rist_log(&logging_settings, RIST_LOG_INFO, 
@@ -1254,6 +1387,13 @@ static void print_statistics(struct rist_callback_object *cb) {
              (unsigned long long)cb->blocks_dropped,
              loss_percent,
              (unsigned long long)cb->rtp_packets_sent);
+    /* Whole-run totals for the UDP hop. Compare "dgrams" against the capture's
+     * final "udp sent=" for the same run: they should be equal, and any deficit
+     * is datagrams the kernel discarded at our socket. */
+    rist_log(&logging_settings, RIST_LOG_INFO,
+             "UDP input: dgrams=%llu ts_packets=%llu (compare dgrams against the capture's 'udp sent=')\n",
+             (unsigned long long)cb->datagrams_received,
+             (unsigned long long)cb->ts_packets_received);
 }
 
 int main(int argc, char *argv[])
@@ -1430,8 +1570,35 @@ int main(int argc, char *argv[])
                 rist_log(&logging_settings, RIST_LOG_ERROR, "Could not bind %s:%d\n", hostname, inputport);
                 goto next;
             } else {
+                uint32_t rcvbuf_before, rcvbuf_after;
+
                 udpsocket_set_nonblocking(callback_object[i].sd);
-                rist_log(&logging_settings, RIST_LOG_INFO, "Input bound: %s:%d\n", hostname, inputport);
+
+                /* Size the receive buffer. udpsocket_open_bind() sets SO_REUSEADDR
+                 * and binds and nothing else -- it does NOT call this -- so the
+                 * socket was running at the kernel's net.core.rmem_default. That
+                 * is the buffer that overflows and discards whole datagrams, and
+                 * whole-datagram loss is the only thing that can make a block come
+                 * up short by exactly 7 or 14 TS packets.
+                 *
+                 * Log both values: the "before" figure IS rmem_default on this
+                 * box, which we have never been able to read directly, and the
+                 * "after" tells us whether the kernel honoured the request or
+                 * capped us at rmem_max. Both matter and neither needs a shell. */
+                rcvbuf_before = udpsocket_get_buffer_size(callback_object[i].sd);
+                if (udpsocket_set_optimal_buffer_size(callback_object[i].sd) < 0) {
+                    rist_log(&logging_settings, RIST_LOG_WARN,
+                             "Could not raise SO_RCVBUF; the kernel capped us. Raise "
+                             "net.core.rmem_max if datagram drops persist.\n");
+                }
+                rcvbuf_after = udpsocket_get_buffer_size(callback_object[i].sd);
+
+                rist_log(&logging_settings, RIST_LOG_INFO,
+                         "Input bound: %s:%d  SO_RCVBUF %u -> %u bytes (~%u datagrams of %d)\n",
+                         hostname, inputport,
+                         (unsigned)rcvbuf_before, (unsigned)rcvbuf_after,
+                         (unsigned)(rcvbuf_after / (2 * (TS_PACKETS_PER_RTP * TS_PACKET_SIZE))),
+                         TS_PACKETS_PER_RTP * TS_PACKET_SIZE);
                 atleast_one_socket_opened = true;
             }
             callback_object[i].udp_config = udp_config;
