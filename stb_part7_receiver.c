@@ -88,7 +88,7 @@
 #include <time.h>
 
 #define RIST_MARK_UNUSED(unused_param) ((void)(unused_param))
-#define RISTSENDER_VERSION "39-PayloadLayout"
+#define RISTSENDER_VERSION "38-DerivedPacing"
 #define MAX_INPUT_COUNT 20
 #define MAX_OUTPUT_COUNT 20
 
@@ -228,14 +228,6 @@ struct marker_data {
     uint16_t rtp_sequence_next;
     uint32_t source_ssrc;
     uint32_t crc32;
-
-    /* Per-payload layout from the headend: how many PSI and null slots sit in
-     * each RTP payload of this block. ES count is the remainder of the seven.
-     * have_layout is false for a pre-layout marker, which keeps the old
-     * pack-everything-first path alive rather than guessing. */
-    bool     have_layout;
-    uint8_t  payload_psi[RTP_PAYLOADS_PER_MARKER];
-    uint8_t  payload_null[RTP_PAYLOADS_PER_MARKER];
 };
 
 struct rist_peer_args {
@@ -522,29 +514,14 @@ static int parse_marker_packet(const uint8_t *ts_packet, struct marker_data *mar
     uint8_t b2 = sec[2];
     if ((b1 & 0x30) != 0x30) return -1;
     uint16_t section_length = (uint16_t)(((b1 & 0x0F) << 8) | b2);
+    if (section_length != 24) return -1;
 
-    /* 24 = the original marker. 24 + RTP_PAYLOADS_PER_MARKER = the same fields
-     * followed by the per-payload layout. Anything else is a marker this build
-     * does not understand, and guessing at its field offsets would be worse
-     * than dropping it. */
-    bool with_layout;
-    if (section_length == 24)
-        with_layout = false;
-    else if (section_length == 24 + RTP_PAYLOADS_PER_MARKER)
-        with_layout = true;
-    else
-        return -1;
-
-    size_t crc_at = with_layout ? (size_t)(23 + RTP_PAYLOADS_PER_MARKER) : 23;
-
-    if (5 + pointer + crc_at + 4 > TS_PACKET_SIZE) return -1;
-
-    uint32_t crc_calc = psi_crc32(sec, crc_at);
+    uint32_t crc_calc = psi_crc32(sec, 23);
     uint32_t crc_pkt =
-        ((uint32_t)sec[crc_at]     << 24) |
-        ((uint32_t)sec[crc_at + 1] << 16) |
-        ((uint32_t)sec[crc_at + 2] <<  8) |
-         (uint32_t)sec[crc_at + 3];
+        ((uint32_t)sec[23] << 24) |
+        ((uint32_t)sec[24] << 16) |
+        ((uint32_t)sec[25] <<  8) |
+         (uint32_t)sec[26];
 
     if (crc_calc != crc_pkt) return -1;
 
@@ -564,18 +541,6 @@ static int parse_marker_packet(const uint8_t *ts_packet, struct marker_data *mar
         ((uint32_t)sec[20] << 16) |
         ((uint32_t)sec[21] <<  8) |
          (uint32_t)sec[22];
-
-    marker->have_layout = with_layout;
-    if (with_layout) {
-        for (int p = 0; p < RTP_PAYLOADS_PER_MARKER; p++) {
-            uint8_t v = sec[23 + p];
-            marker->payload_psi[p]  = (uint8_t)((v >> 4) & 0x0F);
-            marker->payload_null[p] = (uint8_t)(v & 0x0F);
-        }
-    } else {
-        memset(marker->payload_psi, 0, sizeof(marker->payload_psi));
-        memset(marker->payload_null, 0, sizeof(marker->payload_null));
-    }
 
     marker->crc32 = crc_pkt;
     return 0;
@@ -843,61 +808,6 @@ static size_t reconstruct_block(struct rist_callback_object *cb,
 
     if (es + psi_needed + nulls != BLOCK_CONTENT_PACKETS) return 0;
     if (es + psi_needed + nulls > out_max_packets)   return 0;
-
-    /* With a layout, rebuild payload by payload so that payload k here holds
-     * the same ES packets as payload k in the headend's sender queue -- the
-     * copy a NACK or an FSR switch splices in. Packing every ES packet first
-     * (the else branch) puts them in the right block but the wrong payload from
-     * the first null onward, which is what made repairs glitch.
-     *
-     * Where the nulls and PSI sit INSIDE a payload is our choice: the decoder
-     * drops PID 0x1FFF before anything else reads the stream, so the same seven
-     * slots are equivalent whatever the interleave. Only the count matters. */
-    if (marker->have_layout) {
-        size_t es_used = 0, psi_used = 0, nulls_used = 0;
-
-        for (size_t p = 0; p < RTP_PAYLOADS_PER_MARKER; p++) {
-            int psi_p  = marker->payload_psi[p];
-            int null_p = marker->payload_null[p];
-            int es_p   = TS_PACKETS_PER_RTP - psi_p - null_p;
-
-            // A layout that does not describe seven slots, or that claims more
-            // ES than we captured, is not one we can honour. Fail the block and
-            // let the caller drop it rather than emit a misaligned payload.
-            if (es_p < 0) return 0;
-            if (es_used + (size_t)es_p > es) return 0;
-            if (n + TS_PACKETS_PER_RTP > out_max_packets) return 0;
-
-            memcpy(out + n * TS_PACKET_SIZE,
-                   cb->block_buffer + es_used * TS_PACKET_SIZE,
-                   (size_t)es_p * TS_PACKET_SIZE);
-            n += es_p;
-            es_used += es_p;
-
-            for (i = 0; i < (size_t)psi_p; i++, n++, psi_used++) {
-                int which = (int)(psi_used % 2);
-                if (psi_cache_valid[which])
-                    memcpy(out + n * TS_PACKET_SIZE, psi_cache[which], TS_PACKET_SIZE);
-                else if (psi_cache_valid[!which])
-                    memcpy(out + n * TS_PACKET_SIZE, psi_cache[!which], TS_PACKET_SIZE);
-                else
-                    make_null_packet(out + n * TS_PACKET_SIZE);
-            }
-
-            for (i = 0; i < (size_t)null_p; i++, n++)
-                make_null_packet(out + n * TS_PACKET_SIZE);
-
-            nulls_used += null_p;
-        }
-
-        // The layout must account for exactly what the block-wide counts said.
-        // If it does not, the two ends disagree about this block and a splice
-        // would misalign again -- refuse it instead.
-        if (es_used != es || psi_used != psi_needed || nulls_used != nulls)
-            return 0;
-
-        return n;
-    }
 
     memcpy(out, cb->block_buffer, es * TS_PACKET_SIZE);
     n = es;
