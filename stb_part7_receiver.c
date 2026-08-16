@@ -88,7 +88,7 @@
 #include <time.h>
 
 #define RIST_MARK_UNUSED(unused_param) ((void)(unused_param))
-#define RISTSENDER_VERSION "37-RcvbufDrainSilence"
+#define RISTSENDER_VERSION "38-DerivedPacing"
 #define MAX_INPUT_COUNT 20
 #define MAX_OUTPUT_COUNT 20
 
@@ -104,7 +104,50 @@
  * guard in buffer_ts_packet() could never trip. */
 #define MAX_BLOCK_TS_PACKETS (MAX_BLOCK_RTP_PAYLOADS * TS_PACKETS_PER_RTP)
 
-#define PACKET_INTERVAL_US 5560ULL
+/* Emission pacing.
+ *
+ * PACKET_INTERVAL_US is now only the FALLBACK used before enough markers have
+ * been seen to measure the real cadence. It must not be the steady-state value:
+ * a fixed interval encodes one service bitrate, and the block period is set by
+ * the headend's marker rate, which varies per service.
+ *
+ * Why this matters more than it looks. The receiver runs with timing-mode=1
+ * (RIST_TIMING_MODE_ARRIVAL), so it stamps packets on ARRIVAL and releases them
+ * at arrival+buffer -- there is no re-clocking anywhere downstream. Whatever
+ * emission pattern this loop produces is exactly what reaches the decoder. The
+ * recovery peer looks smooth because the headend paces it off a real CBR TS;
+ * this path has to do that job itself.
+ *
+ * A fixed interval fails in BOTH directions and neither is benign:
+ *   too fast -> the schedule falls behind real time, `now < target` is never
+ *               true, usleep never runs, and all payloads of a block go out
+ *               back-to-back in microseconds followed by an idle gap;
+ *   too slow -> the sender throttles below the input rate, the 6000 socket
+ *               backlog grows without bound, latency creeps up and the buffer
+ *               eventually overflows into 7-packet-quantised loss.
+ * Deriving the interval from the measured cadence avoids both. */
+#define PACKET_INTERVAL_US 5560ULL        /* fallback only, until measured */
+
+/* Emit slightly faster than the stream arrives so the backlog can never grow;
+ * the sender then idles waiting for input rather than the input queueing behind
+ * the sender. 94% leaves headroom without bunching the payloads together. */
+#define PACE_DUTY_PCT 94
+
+/* Sanity bounds on the measured block period. Outside these the measurement is
+ * not believable (startup, a resync, a stalled feed) and the fallback is used. */
+#define PACE_PERIOD_MIN_US 2000ULL
+#define PACE_PERIOD_MAX_US 200000ULL
+
+/* EWMA weight for the measured period: new = (old*7 + sample)/8. Slow enough to
+ * ignore per-block jitter, fast enough to follow a genuine bitrate change. */
+#define PACE_EWMA_SHIFT 3
+
+/* If the schedule drifts more than one block period from now -- in either
+ * direction -- resynchronise it instead of trying to catch up or hold back.
+ * Without this the absolute schedule accumulates error indefinitely, which is
+ * how a small constant mismatch turns into a permanent burst pattern. */
+#define PACE_RESYNC_PERIODS 1
+
 #define STATUS_UPDATE_INTERVAL_US 5000000ULL  // 5 seconds
 
 // Circuit breaker thresholds
@@ -142,6 +185,17 @@
 #define EXIT_MARKER_SILENCE 3
 
 #define CONSECUTIVE_MARKER_LOSS_THRESHOLD 10
+
+/* A marker sequence jump larger than this is an OUTAGE we have already come
+ * back from, not a degrading feed. The headend keeps marking while the box is
+ * off air, so on RF return the sequence has legitimately advanced by however
+ * long the outage lasted -- observed as a 937-marker jump after 23s, which the
+ * breaker counted as "937 consecutive marker losses" and tripped on. That cost
+ * ~14s of SHUTDOWN/RECOVERY on the recovery link for a feed that was already
+ * healthy. Total absence of the feed is NO_SIGNAL's job (400ms); the breaker's
+ * consecutive counter is for a feed that is present but rotten. Above this
+ * bound we simply resync. ~100 markers is around 3s of stream. */
+#define MARKER_RESYNC_JUMP 100
 #define VALIDATION_FAILURE_THRESHOLD 10
 #define VALIDATION_FAILURE_WINDOW_US 10000000ULL  // 10 seconds
 #define RECOVERY_GOOD_BLOCKS_REQUIRED 10
@@ -252,6 +306,19 @@ struct rist_callback_object {
 
     // Marker liveness (see MARKER_SILENCE_TIMEOUT_US)
     uint64_t last_marker_time_us;
+
+    /* Measured block cadence, and pacing accounting. paced_slept vs paced_total
+     * is the diagnostic that says which way a mismatch went: near-zero sleeps
+     * means the schedule was behind and we were bursting; sleeps on nearly
+     * every payload means we were throttling the stream. */
+    uint64_t marker_period_us;      /* EWMA of the inter-marker interval */
+    uint64_t pace_interval_us;      /* per-payload interval actually used */
+    uint64_t paced_slept;
+    uint64_t paced_total;
+    uint64_t paced_resyncs;
+    uint64_t paced_slept_last_status;
+    uint64_t paced_total_last_status;
+    uint64_t paced_resyncs_last_status;
 
     // Periodic status tracking
     uint64_t last_status_time;
@@ -621,7 +688,8 @@ static void print_periodic_status(struct rist_callback_object *cb) {
     
     rist_log(&logging_settings, RIST_LOG_INFO,
              "[Status] state=%s markers=%llu (lost=%llu) blocks: sent=%llu dropped=%llu (%.1f%%)"
-             " breaker_trips=%llu udp: dgrams=%llu (total=%llu pkts=%llu)\n",
+             " breaker_trips=%llu udp: dgrams=%llu (total=%llu pkts=%llu)"
+             " pace: period=%lluus interval=%lluus slept=%llu/%llu resync=%llu\n",
              state_str,
              (unsigned long long)markers_delta,
              (unsigned long long)cb->markers_lost,
@@ -631,7 +699,12 @@ static void print_periodic_status(struct rist_callback_object *cb) {
              (unsigned long long)cb->circuit_breaker_trips,
              (unsigned long long)dgram_delta,
              (unsigned long long)cb->datagrams_received,
-             (unsigned long long)cb->ts_packets_received);
+             (unsigned long long)cb->ts_packets_received,
+             (unsigned long long)cb->marker_period_us,
+             (unsigned long long)cb->pace_interval_us,
+             (unsigned long long)(cb->paced_slept - cb->paced_slept_last_status),
+             (unsigned long long)(cb->paced_total - cb->paced_total_last_status),
+             (unsigned long long)(cb->paced_resyncs - cb->paced_resyncs_last_status));
     
     if (cb->circuit_state == STATE_RECOVERY) {
         uint64_t recovery_elapsed = (now - cb->recovery_start_time) / 1000000ULL;
@@ -646,6 +719,9 @@ static void print_periodic_status(struct rist_callback_object *cb) {
     cb->blocks_sent_last_status = cb->blocks_sent;
     cb->blocks_dropped_last_status = cb->blocks_dropped;
     cb->datagrams_last_status = cb->datagrams_received;
+    cb->paced_slept_last_status = cb->paced_slept;
+    cb->paced_total_last_status = cb->paced_total;
+    cb->paced_resyncs_last_status = cb->paced_resyncs;
 }
 
 /* Marker silence => the feed is gone. Exit, so the RIST sender context dies with
@@ -766,16 +842,45 @@ static void send_block_to_rist(struct rist_callback_object *cb) {
 
     uint16_t current_rtp_seq = cb->pending_rtp_seq_start;
 
-    if (!cb->next_send_time_us) {
-        cb->next_send_time_us = get_timestamp_us();
+    /* Per-payload interval derived from the MEASURED block period, spread over
+     * PACE_DUTY_PCT of it so we drain a little faster than the stream arrives.
+     * Falls back to the compiled constant only until enough markers have been
+     * seen to measure anything. */
+    {
+        uint64_t period = cb->marker_period_us;
+        if (period < PACE_PERIOD_MIN_US || period > PACE_PERIOD_MAX_US || num_rtp_payloads == 0)
+            cb->pace_interval_us = PACKET_INTERVAL_US;
+        else
+            cb->pace_interval_us = (period * PACE_DUTY_PCT / 100) / num_rtp_payloads;
+        if (cb->pace_interval_us == 0)
+            cb->pace_interval_us = 1;
+    }
+
+    /* Resynchronise the absolute schedule whenever it has drifted more than one
+     * block period from now, in either direction. An unclamped schedule
+     * accumulates every small mismatch until it is permanently ahead (throttling
+     * the stream) or permanently behind (never sleeping, emitting bursts) -- the
+     * latter is what a fixed interval produced here. */
+    {
+        uint64_t now0 = get_timestamp_us();
+        uint64_t span = (cb->pace_interval_us * num_rtp_payloads) * PACE_RESYNC_PERIODS;
+        if (!cb->next_send_time_us ||
+            cb->next_send_time_us + span < now0 ||
+            now0 + span < cb->next_send_time_us) {
+            if (cb->next_send_time_us)
+                cb->paced_resyncs++;
+            cb->next_send_time_us = now0;
+        }
     }
 
     for (size_t i = 0; i < num_rtp_payloads; i++) {
         uint64_t now = get_timestamp_us();
         uint64_t target = cb->next_send_time_us;
+        cb->paced_total++;
         if (now < target) {
             uint64_t wait_us = target - now;
             if (wait_us < 500000ULL) {
+                cb->paced_slept++;
                 usleep((useconds_t)wait_us);
             }
         }
@@ -800,7 +905,7 @@ static void send_block_to_rist(struct rist_callback_object *cb) {
             cb->rtp_packets_sent++;
         }
 
-        cb->next_send_time_us = target + PACKET_INTERVAL_US;
+        cb->next_send_time_us = target + cb->pace_interval_us;
         current_rtp_seq++;
     }
 
@@ -818,7 +923,26 @@ static void process_marker(struct rist_callback_object *cb, const uint8_t *marke
     }
 
     cb->markers_processed++;
-    cb->last_marker_time_us = get_timestamp_us();   /* liveness, see check_marker_silence */
+
+    /* Measure the real block cadence here, before last_marker_time_us is
+     * overwritten. This is the headend's marker rate, i.e. the true period the
+     * emitter has to match; deriving it beats any compiled-in constant, which
+     * can only ever be right for one service bitrate. Bounded so a startup
+     * gap, a resync or a stalled feed cannot poison the average. */
+    {
+        uint64_t mnow = get_timestamp_us();
+        if (cb->last_marker_time_us && mnow > cb->last_marker_time_us) {
+            uint64_t sample = mnow - cb->last_marker_time_us;
+            if (sample >= PACE_PERIOD_MIN_US && sample <= PACE_PERIOD_MAX_US) {
+                if (!cb->marker_period_us)
+                    cb->marker_period_us = sample;
+                else
+                    cb->marker_period_us +=
+                        ((int64_t)sample - (int64_t)cb->marker_period_us) >> PACE_EWMA_SHIFT;
+            }
+        }
+        cb->last_marker_time_us = mnow;   /* liveness, see check_marker_silence */
+    }
 
     // Handle different circuit breaker states
     if (cb->circuit_state == STATE_SHUTDOWN) {
@@ -898,8 +1022,36 @@ static void process_marker(struct rist_callback_object *cb, const uint8_t *marke
                  expected_marker_seq, marker.marker_sequence, lost_markers);
         
         cb->markers_lost += lost_markers;
+
+        /* A jump this large is an outage we have already returned from, not a
+         * degrading feed: the headend keeps marking while the box is off air,
+         * so the sequence advances by the whole outage. Counting that as
+         * "consecutive marker losses" tripped the breaker on RF RETURN --
+         * observed as a 937-marker jump after 23s, costing ~14s of
+         * SHUTDOWN/RECOVERY on the recovery link for a feed that was already
+         * healthy again. Feed absence is NO_SIGNAL's job at 400ms; the breaker
+         * is for a feed that is present but rotten. Resync and carry on. */
+        if (lost_markers > MARKER_RESYNC_JUMP) {
+            rist_log(&logging_settings, RIST_LOG_INFO,
+                     "Marker jump of %u (>%d) -- treating as resync after an outage,"
+                     " not loss; not counting toward the breaker\n",
+                     lost_markers, MARKER_RESYNC_JUMP);
+            cb->consecutive_marker_losses = 0;
+            cb->resync_count++;
+            cb->synchronized = false;
+            cb->last_marker_sequence = marker.marker_sequence;
+            cb->block_ts_count = 0;
+            cb->block_non_null_count = 1;
+            cb->block_null_count = 0;
+            cb->block_es_count = 0;
+            cb->block_psi_count = 0;
+            /* Drop the schedule too: it is stale by the length of the outage. */
+            cb->next_send_time_us = 0;
+            return;
+        }
+
         cb->consecutive_marker_losses += lost_markers;
-        
+
         // Check for circuit breaker trigger
         if (cb->consecutive_marker_losses >= CONSECUTIVE_MARKER_LOSS_THRESHOLD) {
             char reason[256];
