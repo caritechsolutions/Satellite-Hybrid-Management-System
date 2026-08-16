@@ -85,6 +85,26 @@ static uint32_t current_ssrc = 0;
 static uint8_t  marker_cc = 0;
 static bool first_marker_sent = false;
 
+/* Per-payload layout, one entry per RTP payload in the block.
+ *
+ * The block-wide counts say how many nulls and PSI packets a block held; they
+ * do not say WHICH payload each one sat in, and that is the difference between
+ * a repair that splices cleanly and one that glitches.
+ *
+ * The STB rebuilds these payloads from a PID-filtered capture that never sees a
+ * null. Given totals alone it can only pack every ES packet first and pad at the
+ * end, so from the first null onward its payload N holds different ES packets
+ * than the copy in the sender queue -- the copy a NACK or an FSR switch hands to
+ * the receiver. Substituting one for the other then repeats some ES packets and
+ * drops others.
+ *
+ * Order WITHIN a payload does not matter: the decoder discards PID 0x1FFF before
+ * anything else looks at the stream, so seven slots carrying the same ES packets
+ * in the same order are equivalent however the nulls are interleaved. Only the
+ * per-payload ES count has to agree, and that is what these give the STB. */
+static uint8_t payload_null_count[RTP_PAYLOADS_PER_MARKER];
+static uint8_t payload_psi_count[RTP_PAYLOADS_PER_MARKER];
+
 // CRITICAL: UDP payload accumulator to maintain 7-packet alignment
 static uint8_t udp_buffer[UDP_PAYLOAD_SIZE];
 static size_t udp_buffer_fill = 0;
@@ -272,7 +292,11 @@ static void generate_metadata_marker(uint8_t *marker_packet) {
 
     sec[off++] = 0xBF;  // table_id
 
-    const uint16_t section_length = 24;
+    /* 24 was the layout-free marker; +RTP_PAYLOADS_PER_MARKER bytes of
+     * per-payload layout takes it to 29. The STB switches on this length, so an
+     * STB that predates the layout sees a length it does not recognise and
+     * rejects the marker rather than misreading it -- deploy the two together. */
+    const uint16_t section_length = 24 + RTP_PAYLOADS_PER_MARKER;
     sec[off++] = (uint8_t)(0x30 | ((section_length >> 8) & 0x0F));
     sec[off++] = (uint8_t)(section_length & 0xFF);
 
@@ -311,6 +335,17 @@ static void generate_metadata_marker(uint8_t *marker_packet) {
     sec[off++] = (uint8_t)((current_ssrc >>  8) & 0xFF);
     sec[off++] = (uint8_t)( current_ssrc        & 0xFF);
 
+    /* payload_layout[RTP_PAYLOADS_PER_MARKER]: high nibble = PSI packets in that
+     * payload, low nibble = null packets. ES count is the remainder of the seven
+     * slots, so the STB fills payload k with (7 - psi - null) captured packets
+     * and tops it up -- which is what keeps its payload k carrying the same ES
+     * packets as the copy in the sender queue. A nibble each rather than three
+     * packed bits: both max out at 7, and this stays readable in a hex dump. */
+    for (int p = 0; p < RTP_PAYLOADS_PER_MARKER; p++) {
+        sec[off++] = (uint8_t)(((payload_psi_count[p] & 0x0F) << 4) |
+                                (payload_null_count[p] & 0x0F));
+    }
+
     // CRC
     uint32_t crc = calculate_crc32(sec, off);
     sec[off++] = (uint8_t)((crc >> 24) & 0xFF);
@@ -326,6 +361,14 @@ static void generate_metadata_marker(uint8_t *marker_packet) {
            current_psi_count,
            (unsigned)(current_non_null_count + current_null_count + current_psi_count),
            current_block_start_rtp_seq, next_lsb, current_ssrc);
+
+    printf("[MARKER] layout es/psi/null per payload:");
+    for (int p = 0; p < RTP_PAYLOADS_PER_MARKER; p++) {
+        printf(" %d/%u/%u",
+               TS_PACKETS_PER_RTP - payload_psi_count[p] - payload_null_count[p],
+               payload_psi_count[p], payload_null_count[p]);
+    }
+    printf("\n");
 }
 
 // -------------------- RIST data callback --------------------
@@ -357,19 +400,32 @@ static int cb_recv(void *arg, struct rist_data_block *b) {
     // Count null/non-null TS packets in this RTP payload
     const uint8_t *ts_data = (const uint8_t *)b->payload;
     int ts_packets = b->payload_len / TS_PACKET_SIZE;
+    /* Counted per payload as well as per block. This callback is already
+     * invoked once per RTP payload, so the split costs nothing beyond two
+     * locals -- the information was being accumulated away. */
+    uint8_t this_payload_nulls = 0;
+    uint8_t this_payload_psi = 0;
+
     for (int i = 0; i < ts_packets; i++) {
         const uint8_t *ts = ts_data + i * TS_PACKET_SIZE;
         if (ts[0] != 0x47) continue;
         if (is_null_packet(ts)) {
             current_null_count++;
+            this_payload_nulls++;
         } else if (is_psi_packet(ts)) {
             // PSI is regenerated downstream (their mux) and re-injected upstream
             // (the STB capture), so it can never agree between the two ends.
             // Counted separately and left OUT of non_null; still forwarded below.
             current_psi_count++;
+            this_payload_psi++;
         } else {
             current_non_null_count++;   // marker + elementary streams only
         }
+    }
+
+    if (rtp_packets_in_block < RTP_PAYLOADS_PER_MARKER) {
+        payload_null_count[rtp_packets_in_block] = this_payload_nulls;
+        payload_psi_count[rtp_packets_in_block]  = this_payload_psi;
     }
 
     // Add each TS packet to UDP buffer to maintain 7-packet alignment
