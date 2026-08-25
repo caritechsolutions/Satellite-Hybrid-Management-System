@@ -145,6 +145,12 @@ build_tool headend_part7_sender.c      headend_part7_sender      "-lrist -lpthre
 build_tool rist_watchdog.c             rist_watchdog             ""
 build_tool ristsender_marker.c         ristsender_marker         "-lrist -lpthread"
 
+# Part 8 (out-of-band) recovery server. Separate binary on purpose: librist keeps
+# FSR state in udp.c file-scope statics, so running this in its own process is
+# what stops it disturbing the Part 6/7 units above. Ingests the full downlink
+# multiplex and indexes PCR -> RTP sequence for PCR-addressed recovery.
+build_tool part8_recovery_server.c     part8_recovery_server     "-lrist -lpthread -lm"
+
 # STB-side Part 7 receiver: validates the markers headend_part7_sender inserts,
 # counting elementary streams only and rebuilding each block to 35 packets. This
 # runs on the BOX (ARM) -- built here only so a compile break is caught on the
@@ -358,7 +364,7 @@ say "Done"
 if [ "$PORT" = "80" ]; then URL="http://${IP:-<server-ip>}/"; else URL="http://${IP:-<server-ip>}:${PORT}/"; fi
 info "web ui   : ${URL}"
 info "code     : ${APP_DIR} (git ${BRANCH})"
-info "binaries : /usr/local/bin/{ristsender,ristreceiver,ristreceiver_with_markers,headend_part7_sender,rist_watchdog}"
+info "binaries : /usr/local/bin/{ristsender,ristreceiver,ristreceiver_with_markers,headend_part7_sender,part8_recovery_server,rist_watchdog}"
 info "tsduck   : $(command -v tsp >/dev/null 2>&1 && tsp --version 2>&1 | head -1 || echo \"not installed\")"
 info "app log  : ${LOG_DIR}/rist-monitor.log"
 info "unit log : journalctl -u ristsender-<channel> -f"
