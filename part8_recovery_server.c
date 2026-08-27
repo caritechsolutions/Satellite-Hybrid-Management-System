@@ -43,7 +43,9 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -144,7 +146,30 @@ static uint64_t now_us(void)
 	return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
 }
 
-static void on_signal(int sig) { (void)sig; running = 0; }
+/*
+ * Shutdown self-pipe.
+ *
+ * Clearing `running` is not enough on its own: the debug thread parks in a
+ * blocking accept() and only rechecks the flag when a connection happens to
+ * arrive, so pthread_join() in main never returns and the process hangs after
+ * logging [STOP]. It keeps its UDP sockets the whole time, so the next start
+ * cannot bind and talks to nothing -- and systemd's SIGKILL on timeout leaves
+ * the same orphan across a restart.
+ *
+ * write() is async-signal-safe, so the handler can poke the pipe directly and
+ * every blocking wait can select on it.
+ */
+static int shutdown_pipe[2] = { -1, -1 };
+
+static void on_signal(int sig)
+{
+	(void)sig;
+	running = 0;
+	if (shutdown_pipe[1] >= 0) {
+		char c = 1;
+		(void)!write(shutdown_pipe[1], &c, 1);
+	}
+}
 
 /*
  * Signed difference between two 33-bit PCR bases, valid across the ~26.5 hour
@@ -291,17 +316,65 @@ static void catalogue_insert(uint16_t pid, uint64_t base, bool disc,
 }
 
 /* ------------------------------------------------------------- resolution */
+/*
+ * Resolution outcome.
+ *
+ * This is deliberately a status, not a bool. A nearest-PCR search on a
+ * non-empty ring ALWAYS finds something, so "did we find an entry" and "is that
+ * entry any use to the caller" are different questions. Collapsing them into
+ * one flag invites exactly one bug:
+ *
+ *     if (rr.ok) send_retransmission(rr.start_ext, rr.end_ext);
+ *
+ * which will cheerfully serve a range an hour away from what was asked for,
+ * because the only thing saying otherwise was a free-text note nobody read.
+ * Only RESOLVE_OK means "serve this range".
+ */
+enum resolve_status {
+	/* NOT zero. resolve() memsets its result, and a zeroed struct must never
+	 * come out meaning "serve this". Zero is the unset state and is not OK. */
+	RESOLVE_UNSET = 0,
+	RESOLVE_OK,                /* usable: start_ext..end_ext may be served */
+	RESOLVE_NO_CATALOGUE,      /* no ring for this PID at all */
+	RESOLVE_NO_ENTRY,          /* ring exists but every epoch came up empty */
+	RESOLVE_BEFORE_EPOCH,      /* request predates the epoch we resolved into */
+	RESOLVE_OUTSIDE_BUFFER,    /* nearest PCR lies further away than the buffer */
+};
+
+static const char *resolve_status_str(enum resolve_status s)
+{
+	switch (s) {
+	case RESOLVE_UNSET:          return "UNSET";
+	case RESOLVE_OK:             return "OK";
+	case RESOLVE_NO_CATALOGUE:   return "NO_CATALOGUE";
+	case RESOLVE_NO_ENTRY:       return "NO_ENTRY";
+	case RESOLVE_BEFORE_EPOCH:   return "BEFORE_EPOCH";
+	case RESOLVE_OUTSIDE_BUFFER: return "OUTSIDE_BUFFER";
+	}
+	return "UNKNOWN";
+}
+
 struct resolve_result {
-	bool     ok;
+	enum resolve_status status;
+	/*
+	 * Populated whenever an entry was found at all, INCLUDING on BEFORE_EPOCH
+	 * and OUTSIDE_BUFFER. On any non-OK status they are diagnostic only: they
+	 * say what the nearest thing was, not what may be sent.
+	 */
 	uint64_t start_ext, end_ext;
 	uint64_t actual_pcr;
 	uint32_t epoch;
 	uint8_t  slot;
 	bool     end_estimated;      /* live edge: end came from the rate fallback */
-	bool     before_buffer;      /* request older than anything we hold */
 	int64_t  pcr_error;          /* actual - requested, signed ticks */
 	char     note[160];
 };
+
+/* The single test a retransmission path should make. */
+static inline bool resolve_serviceable(const struct resolve_result *rr)
+{
+	return rr->status == RESOLVE_OK;
+}
 
 /*
  * Nearest entry to `base` within one epoch, by absolute modular difference.
@@ -360,6 +433,7 @@ static struct resolve_result resolve(uint16_t pid, uint64_t base, uint64_t durat
 	struct pcr_ring *r = ring_get(pid, false);
 	if (!r || r->count == 0) {
 		pthread_mutex_unlock(&catalogue_lock);
+		rr.status = RESOLVE_NO_CATALOGUE;
 		snprintf(rr.note, sizeof(rr.note), "no PCR catalogue for pid 0x%04X", pid);
 		return rr;
 	}
@@ -403,12 +477,13 @@ static struct resolve_result resolve(uint16_t pid, uint64_t base, uint64_t durat
 	}
 	if (!found) {
 		pthread_mutex_unlock(&catalogue_lock);
+		rr.status = RESOLVE_NO_ENTRY;
 		snprintf(rr.note, sizeof(rr.note), "no entry in any epoch for pid 0x%04X", pid);
 		return rr;
 	}
 
 	struct pcr_entry *start = ring_at(r, idx);
-	rr.ok         = true;
+	rr.status     = RESOLVE_OK;
 	rr.start_ext  = start->ext_seq;
 	rr.actual_pcr = start->pcr_base;
 	rr.epoch      = start->epoch;
@@ -438,19 +513,21 @@ static struct resolve_result resolve(uint16_t pid, uint64_t base, uint64_t durat
 	uint64_t buffer_ticks = (uint64_t)g_buffer_ms * PCR_HZ / 1000ULL;
 
 	if (epoch_oldest && pcr_diff(base, epoch_oldest->pcr_base) < 0 && start == epoch_oldest) {
-		rr.before_buffer = true;
+		rr.status = RESOLVE_BEFORE_EPOCH;
 		snprintf(rr.note, sizeof(rr.note),
 			"requested PCR precedes epoch %" PRIu32 " by %" PRId64 " ticks",
 			start->epoch, pcr_diff(epoch_oldest->pcr_base, base));
 	}
+	/* Checked second and allowed to overwrite: it is the stronger statement of
+	 * the two, and it holds regardless of how the epochs are arranged. */
 	if (err_abs > buffer_ticks) {
-		rr.before_buffer = true;
+		rr.status = RESOLVE_OUTSIDE_BUFFER;
 		snprintf(rr.note, sizeof(rr.note),
 			"nearest PCR is %" PRIu64 " ticks (%.0f ms) from the request, beyond the "
 			"%d ms buffer -- outside the catalogue",
 			err_abs, (double)err_abs * 1000.0 / (double)PCR_HZ, g_buffer_ms);
 	}
-	if (rr.before_buffer)
+	if (rr.status != RESOLVE_OK)
 		g_requests_outside_buffer++;
 
 	/* END: first entry at or past base + duration, same epoch. */
@@ -609,6 +686,21 @@ static void log_periodic(void)
  */
 static char g_debug_path[108] = DEFAULT_DEBUG_SOCK;   /* sun_path is 108 */
 
+/* Write straight to the client instead of accumulating. `stats` lists one line
+ * per PCR-bearing PID, and this multiplex has 33 of them; a fixed 1 KB buffer
+ * silently dropped the tail, so anything reading the socket saw a short list
+ * with no indication it had been cut. */
+static void debug_emit(int fd, const char *fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (n > 0)
+		(void)!write(fd, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
+}
+
 static void debug_handle(int fd, const char *line)
 {
 	char out[1024];
@@ -616,8 +708,26 @@ static void debug_handle(int fd, const char *line)
 
 	if (sscanf(line, "resolve %u %llu %llu", &pid, &base, &dur) == 3) {
 		struct resolve_result rr = resolve((uint16_t)pid, base & PCR_MASK33, dur);
-		if (!rr.ok) {
-			snprintf(out, sizeof(out), "ERR %s\n", rr.note);
+		if (!resolve_serviceable(&rr)) {
+			/*
+			 * Non-OK statuses that still found a nearest entry report it, because
+			 * knowing what the catalogue DOES hold is the useful diagnostic. The
+			 * status word is what decides serviceability -- never the note, and
+			 * never the presence of a start_ext.
+			 */
+			if (rr.status == RESOLVE_BEFORE_EPOCH || rr.status == RESOLVE_OUTSIDE_BUFFER)
+				snprintf(out, sizeof(out),
+					"%s pid=0x%04X  NOT SERVICEABLE\n"
+					"  requested_pcr = %llu\n"
+					"  nearest_pcr   = %" PRIu64 "  (error %+" PRId64 " ticks, %+.3f ms)\n"
+					"  note          = %s\n",
+					resolve_status_str(rr.status), pid, base,
+					rr.actual_pcr, rr.pcr_error,
+					(double)rr.pcr_error * 1000.0 / (double)PCR_HZ,
+					rr.note[0] ? rr.note : "-");
+			else
+				snprintf(out, sizeof(out), "%s %s\n",
+					resolve_status_str(rr.status), rr.note);
 		} else {
 			snprintf(out, sizeof(out),
 				"OK pid=0x%04X\n"
@@ -638,22 +748,23 @@ static void debug_handle(int fd, const char *line)
 				rr.note[0] ? rr.note : "-");
 		}
 	} else if (strncmp(line, "stats", 5) == 0) {
-		int n = snprintf(out, sizeof(out),
+		debug_emit(fd,
 			"ext_seq=%" PRIu64 " payloads=%" PRIu64 " ts_in=%" PRIu64
 			" queue_now=%" PRIu64 " queue_max=%" PRIu64 " queue_ms=%" PRIu64
-			" queue_bytes=%" PRIu64 " ceiling=%llu tripwires=%c%c\n",
+			" queue_bytes=%" PRIu64 " ceiling=%llu outside_buffer=%" PRIu64
+			" tripwires=%c%c\n",
 			g_ext_seq, g_payloads_written, g_ts_packets_in,
 			g_queue_size_now, g_queue_size_max, g_queue_time_ms, g_queue_bytesize,
-			(unsigned long long)SEQ_SPACE,
+			(unsigned long long)SEQ_SPACE, g_requests_outside_buffer,
 			g_tripwire_a_fired ? 'A' : '-', g_tripwire_b_fired ? 'B' : '-');
 		pthread_mutex_lock(&catalogue_lock);
-		for (int pid = 0; pid < MAX_PIDS && n < (int)sizeof(out) - 96; pid++) {
+		for (int pid = 0; pid < MAX_PIDS; pid++) {
 			if (!rings[pid] || rings[pid]->count == 0) continue;
-			n += snprintf(out + n, sizeof(out) - n,
-				"pid 0x%04X depth=%zu epoch=%" PRIu32 "\n",
-				pid, rings[pid]->count, rings[pid]->epoch);
+			debug_emit(fd, "pid 0x%04X depth=%zu total=%" PRIu64 " epoch=%" PRIu32 "\n",
+				pid, rings[pid]->count, rings[pid]->total_entries, rings[pid]->epoch);
 		}
 		pthread_mutex_unlock(&catalogue_lock);
+		return;                     /* already written, in full */
 	} else {
 		snprintf(out, sizeof(out),
 			"ERR usage: 'resolve <pid> <pcr_base> <duration_ticks>' | 'stats'\n");
@@ -685,9 +796,30 @@ static void *debug_thread(void *arg)
 		"[DEBUG] listening on unix:%s  (echo 'resolve <pid> <base> <dur>' | nc -U %s)\n",
 		g_debug_path, g_debug_path);
 
+	/*
+	 * Wait on the listening socket AND the shutdown pipe. A bare blocking
+	 * accept() here is what used to wedge the whole process on SIGTERM: main
+	 * gets to pthread_join() and waits forever for a thread that only looks at
+	 * `running` once a client happens to connect.
+	 */
 	while (running) {
+		struct pollfd pfd[2];
+		pfd[0].fd = srv;              pfd[0].events = POLLIN; pfd[0].revents = 0;
+		pfd[1].fd = shutdown_pipe[0]; pfd[1].events = POLLIN; pfd[1].revents = 0;
+
+		int pr = poll(pfd, shutdown_pipe[0] >= 0 ? 2 : 1, -1);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (pfd[1].revents & POLLIN)   /* shutdown poked us; do not drain it, */
+			break;                     /* other waiters need to see it too    */
+		if (!(pfd[0].revents & POLLIN))
+			continue;
+
 		int c = accept(srv, NULL, NULL);
-		if (c < 0) { if (running) usleep(100000); continue; }
+		if (c < 0) { if (running && errno != EINTR) usleep(100000); continue; }
 		char buf[512];
 		ssize_t n = read(c, buf, sizeof(buf) - 1);
 		if (n > 0) { buf[n] = '\0'; debug_handle(c, buf); }
@@ -854,6 +986,11 @@ int main(int argc, char *argv[])
 	}
 	if (!inurl || !outurl) { usage(argv[0]); return 1; }
 
+	/* Before the handlers, so a signal can never find a half-built pipe. */
+	if (pipe(shutdown_pipe) < 0) {
+		fprintf(stderr, "pipe() failed: %s\n", strerror(errno));
+		return 1;
+	}
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
@@ -929,10 +1066,19 @@ int main(int argc, char *argv[])
 	while (running) {
 		struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
 		fd_set rf; FD_ZERO(&rf); FD_SET(in, &rf);
-		if (select(in + 1, &rf, NULL, NULL, &tv) <= 0) {
+		int maxfd = in;
+		if (shutdown_pipe[0] >= 0) {
+			FD_SET(shutdown_pipe[0], &rf);
+			if (shutdown_pipe[0] > maxfd) maxfd = shutdown_pipe[0];
+		}
+		if (select(maxfd + 1, &rf, NULL, NULL, &tv) <= 0) {
 			if (now_us() > next_log) { log_periodic(); tripwire_rate_check(); next_log = now_us() + 5000000ULL; }
 			continue;
 		}
+		if (shutdown_pipe[0] >= 0 && FD_ISSET(shutdown_pipe[0], &rf))
+			break;
+		if (!FD_ISSET(in, &rf))
+			continue;
 
 		ssize_t n = recv(in, rx, sizeof(rx), 0);
 		if (n <= 0) continue;
@@ -975,6 +1121,9 @@ int main(int argc, char *argv[])
 	log_periodic();
 	close(in);
 	pthread_join(dbg, NULL);
+	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] debug thread joined\n");
 	rist_destroy(sender_ctx);
+	if (shutdown_pipe[0] >= 0) { close(shutdown_pipe[0]); close(shutdown_pipe[1]); }
+	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] clean exit\n");
 	return 0;
 }
