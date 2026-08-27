@@ -82,6 +82,24 @@
  * mux jitter (~10 ms) and far below any real discontinuity. */
 #define DISC_BACK_TICKS     (PCR_HZ / 100)
 
+/* A forward PCR step larger than this is REPORTED but does not start an epoch:
+ * a forward jump leaves the ring sorted, so the nearest-match still works.
+ * One second is roughly 25x the largest legitimate PCR interval measured on this
+ * transponder (40.94 ms) and 10x the DVB maximum, so a PID merely going quiet
+ * for a moment will not trip it -- which matters, because O3's value depends on
+ * a discontinuity report meaning something. */
+#define DISC_FWD_TICKS      (PCR_HZ)
+
+/* Per-PID floor between discontinuity log lines. A source stuck flapping must
+ * not be able to fill the journal; the event ring and the counters stay exact
+ * either way, only the log lines are thinned. */
+#define DISC_LOG_MIN_GAP_US 1000000ULL
+
+/* The measured transponder rate: 59,145,890 b/s, agreed by PCR-delta-vs-byte-
+ * offset, tsanalyze, and a separate 30 s capture. Used only for operator-facing
+ * headroom figures, never for control decisions. */
+#define MEASURED_RATE_BPS   59145890ULL
+
 #define DEFAULT_BUFFER_MS   10000
 #define DEFAULT_RCVBUF      (32 * 1024 * 1024)
 #define DEFAULT_DEBUG_SOCK  "/tmp/part8_recovery.sock"
@@ -125,6 +143,46 @@ static uint64_t g_bytes_in = 0;
 static uint64_t g_sync_errors = 0;
 static uint64_t g_requests_outside_buffer = 0;
 
+/*
+ * Discontinuity event log (O3).
+ *
+ * The epoch handling in catalogue_insert() and the nearest-across-all-epochs
+ * search in resolve() have only ever been exercised synthetically -- the
+ * captures available so far contained no discontinuities at all. This records
+ * every one seen on a live feed so the logic can finally be checked against real
+ * data, and so an observer can resolve either side of the event afterwards
+ * rather than having to catch it live in the log.
+ */
+#define DISC_LOG_CAP 256
+struct disc_event {
+	uint64_t wall_us;          /* CLOCK_MONOTONIC, matched to the log stamps */
+	uint64_t wall_real;        /* seconds since the epoch, for correlation   */
+	uint16_t pid;
+	uint8_t  kind;             /* 0 = indicator (no PCR), 1 = PCR indicator,
+	                              2 = backward jump, 3 = forward jump        */
+	uint32_t epoch;            /* epoch AFTER the event                      */
+	uint64_t pcr_before, pcr_after;
+	int64_t  delta;
+	uint64_t ext_seq;
+};
+static struct disc_event g_disc[DISC_LOG_CAP];
+static size_t   g_disc_head = 0;
+static uint64_t g_disc_total = 0;
+static uint64_t g_disc_indicator_nopcr = 0;
+static pthread_mutex_t disc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *disc_kind_str(uint8_t k)
+{
+	switch (k) {
+	case 0: return "indicator-no-pcr";
+	case 1: return "indicator-with-pcr";
+	case 2: return "backward-jump";
+	case 3: return "forward-jump";
+	}
+	return "?";
+}
+
+
 static int      g_buffer_ms = DEFAULT_BUFFER_MS;
 static uint64_t g_start_us = 0;
 
@@ -160,6 +218,28 @@ static uint64_t now_us(void)
  * every blocking wait can select on it.
  */
 static int shutdown_pipe[2] = { -1, -1 };
+
+static void disc_record(uint16_t pid, uint8_t kind, uint32_t epoch,
+                        uint64_t before, uint64_t after, int64_t delta,
+                        uint64_t ext_seq)
+{
+	struct timespec rt;
+	clock_gettime(CLOCK_REALTIME, &rt);
+	pthread_mutex_lock(&disc_lock);
+	struct disc_event *e = &g_disc[g_disc_head];
+	e->wall_us    = now_us();
+	e->wall_real  = (uint64_t)rt.tv_sec;
+	e->pid        = pid;
+	e->kind       = kind;
+	e->epoch      = epoch;
+	e->pcr_before = before;
+	e->pcr_after  = after;
+	e->delta      = delta;
+	e->ext_seq    = ext_seq;
+	g_disc_head = (g_disc_head + 1) % DISC_LOG_CAP;
+	g_disc_total++;
+	pthread_mutex_unlock(&disc_lock);
+}
 
 static void on_signal(int sig)
 {
@@ -203,6 +283,35 @@ static uint64_t pcr_abs_diff(uint64_t a, uint64_t b)
  *   AFC == 3 (adaptation+payload) -> length <= 182, else it overruns
  *   a PCR needs the flags byte plus 6 PCR bytes -> length >= 7
  */
+/*
+ * Adaptation-field discontinuity_indicator on ANY packet, PCR-bearing or not.
+ *
+ * catalogue_insert() only ever sees packets that carry a PCR, so an indicator
+ * set on a plain payload packet -- which is the common case, since the flag
+ * marks the start of the discontinuity and the next PCR may be several packets
+ * later -- would never be recorded at all. That matters here specifically:
+ * validating the epoch logic against real data means knowing a discontinuity
+ * happened even when the catalogue did not act on it.
+ */
+static bool ts_discontinuity_flag(const uint8_t *p, uint16_t *pid_out)
+{
+	if (p[0] != TS_SYNC)
+		return false;
+	uint8_t afc = (uint8_t)((p[3] >> 4) & 0x03);
+	if (!(afc & 0x2))
+		return false;
+	if (p[4] == 0)
+		return false;                       /* stuffing-only AF, no flag byte */
+	if (afc == 2 && p[4] != 183)
+		return false;
+	if (afc == 3 && p[4] > 182)
+		return false;
+	if (!(p[5] & 0x80))
+		return false;
+	*pid_out = (uint16_t)(((p[1] & 0x1F) << 8) | p[2]);
+	return true;
+}
+
 static bool ts_extract_pcr(const uint8_t *p, uint16_t *pid_out,
                            uint64_t *base_out, bool *disc_out)
 {
@@ -287,9 +396,28 @@ static void catalogue_insert(uint16_t pid, uint64_t base, bool disc,
 			r->epoch++;
 			r->epoch_changes++;
 			rist_log(&logging_settings, RIST_LOG_WARN,
-				"[CATALOGUE] pid 0x%04X discontinuity: %s, %" PRId64
-				" ticks, entering epoch %" PRIu32 "\n",
-				pid, disc ? "indicator set" : "backward jump", d, r->epoch);
+				"[DISC] pid 0x%04X %s: %" PRId64 " ticks (%.1f ms), "
+				"pcr %" PRIu64 " -> %" PRIu64 ", entering epoch %" PRIu32
+				", ext_seq %" PRIu64 "\n",
+				pid, disc ? "indicator set" : "backward jump", d,
+				(double)d * 1000.0 / (double)PCR_HZ,
+				r->last_base, base, r->epoch, ext_seq);
+			disc_record(pid, disc ? 1 : 2, r->epoch, r->last_base, base, d, ext_seq);
+		} else if (d > (int64_t)DISC_FWD_TICKS) {
+			/*
+			 * A large forward jump is a discontinuity too, but it does NOT need a
+			 * new epoch: the ring stays sorted, so the nearest-match still works.
+			 * Recorded rather than acted on -- O3 wants to know it happened, and
+			 * silently starting an epoch here would split a still-searchable
+			 * segment for no benefit.
+			 */
+			rist_log(&logging_settings, RIST_LOG_WARN,
+				"[DISC] pid 0x%04X forward jump: +%" PRId64 " ticks (%.1f ms), "
+				"pcr %" PRIu64 " -> %" PRIu64 ", epoch %" PRIu32 " retained, "
+				"ext_seq %" PRIu64 "\n",
+				pid, d, (double)d * 1000.0 / (double)PCR_HZ,
+				r->last_base, base, r->epoch, ext_seq);
+			disc_record(pid, 3, r->epoch, r->last_base, base, d, ext_seq);
 		} else if (r->iv_n < UINT64_MAX) {
 			uint64_t iv = wall - r->last_wall_us;
 			if (iv < r->iv_min) r->iv_min = iv;
@@ -683,6 +811,7 @@ static void log_periodic(void)
  * Local only -- a unix socket, never a wildcard-bound port. Line protocol:
  *   resolve <pid> <pcr_base> <duration_ticks>
  *   stats
+ *   events
  */
 static char g_debug_path[108] = DEFAULT_DEBUG_SOCK;   /* sun_path is 108 */
 
@@ -752,10 +881,12 @@ static void debug_handle(int fd, const char *line)
 			"ext_seq=%" PRIu64 " payloads=%" PRIu64 " ts_in=%" PRIu64
 			" queue_now=%" PRIu64 " queue_max=%" PRIu64 " queue_ms=%" PRIu64
 			" queue_bytes=%" PRIu64 " ceiling=%llu outside_buffer=%" PRIu64
+			" disc_total=%" PRIu64 " disc_nopcr=%" PRIu64
 			" tripwires=%c%c\n",
 			g_ext_seq, g_payloads_written, g_ts_packets_in,
 			g_queue_size_now, g_queue_size_max, g_queue_time_ms, g_queue_bytesize,
 			(unsigned long long)SEQ_SPACE, g_requests_outside_buffer,
+			g_disc_total, g_disc_indicator_nopcr,
 			g_tripwire_a_fired ? 'A' : '-', g_tripwire_b_fired ? 'B' : '-');
 		pthread_mutex_lock(&catalogue_lock);
 		for (int pid = 0; pid < MAX_PIDS; pid++) {
@@ -765,9 +896,33 @@ static void debug_handle(int fd, const char *line)
 		}
 		pthread_mutex_unlock(&catalogue_lock);
 		return;                     /* already written, in full */
+	} else if (strncmp(line, "events", 6) == 0) {
+		/*
+		 * The discontinuity ring (O3). Reported after the fact on purpose: the
+		 * point is to be able to resolve either side of a real discontinuity
+		 * once one occurs, without having to catch it live in the journal.
+		 */
+		pthread_mutex_lock(&disc_lock);
+		uint64_t total = g_disc_total;
+		size_t n = total < DISC_LOG_CAP ? (size_t)total : DISC_LOG_CAP;
+		debug_emit(fd, "disc_total=%" PRIu64 " indicator_nopcr=%" PRIu64
+			" shown=%zu cap=%d\n", total, g_disc_indicator_nopcr, n, DISC_LOG_CAP);
+		for (size_t i = 0; i < n; i++) {
+			/* oldest first */
+			size_t idx = (g_disc_head + DISC_LOG_CAP - n + i) % DISC_LOG_CAP;
+			struct disc_event *e = &g_disc[idx];
+			debug_emit(fd,
+				"event real=%" PRIu64 " mono_us=%" PRIu64 " pid=0x%04X kind=%s"
+				" epoch=%" PRIu32 " pcr_before=%" PRIu64 " pcr_after=%" PRIu64
+				" delta=%" PRId64 " ext_seq=%" PRIu64 "\n",
+				e->wall_real, e->wall_us, e->pid, disc_kind_str(e->kind),
+				e->epoch, e->pcr_before, e->pcr_after, e->delta, e->ext_seq);
+		}
+		pthread_mutex_unlock(&disc_lock);
+		return;
 	} else {
 		snprintf(out, sizeof(out),
-			"ERR usage: 'resolve <pid> <pcr_base> <duration_ticks>' | 'stats'\n");
+			"ERR usage: 'resolve <pid> <pcr_base> <duration_ticks>' | 'stats' | 'events'\n");
 	}
 	(void)!write(fd, out, strlen(out));
 }
@@ -844,8 +999,8 @@ static int open_input(const char *host, int port, int want_rcvbuf)
 	 * silently clamps to net.core.rmem_max and reports back double what it
 	 * granted. We lost days to exactly this on the STB at 1/23rd of this rate,
 	 * where the default 87380 held ~33 datagrams against 36-datagram bursts and
-	 * the loss looked like a satellite problem. At 40 Mb/s the margin is far
-	 * thinner, so this is logged, not assumed.
+	 * the loss looked like a satellite problem. At the measured multiplex rate
+	 * the margin is far thinner, so this is logged, not assumed.
 	 */
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want_rcvbuf, sizeof(want_rcvbuf)) < 0)
 		rist_log(&logging_settings, RIST_LOG_WARN, "SO_RCVBUF set failed: %s\n", strerror(errno));
@@ -866,11 +1021,20 @@ static int open_input(const char *host, int port, int want_rcvbuf)
 		return -1;
 	}
 
+	/*
+	 * The holding time below is quoted against MEASURED_RATE_BPS, not against a
+	 * guess. An earlier version of this line said "at 40 Mb/s", which was an
+	 * estimate 48% below the real transponder rate and therefore overstated the
+	 * headroom by the same margin. If the feed rate changes, change the constant
+	 * -- do not leave a stale figure in an operator-facing log line.
+	 */
 	double datagrams = (double)got / 1316.0;
 	rist_log(&logging_settings, RIST_LOG_INFO,
 		"[INPUT] bound :%d  SO_RCVBUF requested %d -> kernel reports %d bytes "
-		"(~%.0f datagrams of 1316, ~%.0f ms at 40 Mb/s)%s\n",
-		port, want_rcvbuf, got, datagrams, datagrams * 1316.0 * 8.0 / 40e6 * 1000.0,
+		"(~%.0f datagrams of 1316, ~%.0f ms at %.1f Mb/s)%s\n",
+		port, want_rcvbuf, got, datagrams,
+		datagrams * 1316.0 * 8.0 / (double)MEASURED_RATE_BPS * 1000.0,
+		(double)MEASURED_RATE_BPS / 1e6,
 		got < want_rcvbuf ? "  << CLAMPED, raise net.core.rmem_max" : "");
 	if (got < want_rcvbuf)
 		rist_log(&logging_settings, RIST_LOG_WARN,
@@ -895,11 +1059,28 @@ static void emit_payload(uint8_t *stage)
 	 * PCR_PID explicitly, so we only ever look up what we are asked for, and an
 	 * index built from observation cannot go stale when a PMT changes. */
 	for (int s = 0; s < TS_PER_RTP; s++) {
+		const uint8_t *p = stage + s * TS_PACKET_SIZE;
 		uint16_t pid; uint64_t base; bool disc;
-		if (ts_extract_pcr(stage + s * TS_PACKET_SIZE, &pid, &base, &disc)) {
+		if (ts_extract_pcr(p, &pid, &base, &disc)) {
 			pthread_mutex_lock(&catalogue_lock);
 			catalogue_insert(pid, base, disc, ext, (uint8_t)s);
 			pthread_mutex_unlock(&catalogue_lock);
+		} else if (ts_discontinuity_flag(p, &pid)) {
+			/* Flagged but carrying no PCR, so the catalogue never sees it.
+			 * Counted and reported anyway: O3 needs to know a discontinuity
+			 * happened even where there was nothing for the ring to act on. */
+			g_disc_indicator_nopcr++;
+			disc_record(pid, 0, 0, 0, 0, 0, ext);
+			static uint64_t last_log[8];      /* tiny per-PID-hash throttle */
+			uint64_t n = now_us();
+			uint64_t *slot = &last_log[pid & 7];
+			if (n - *slot > DISC_LOG_MIN_GAP_US) {
+				*slot = n;
+				rist_log(&logging_settings, RIST_LOG_WARN,
+					"[DISC] pid 0x%04X discontinuity_indicator set on a packet "
+					"with no PCR, ext_seq %" PRIu64 " (total %" PRIu64 ")\n",
+					pid, ext, g_disc_indicator_nopcr);
+			}
 		}
 	}
 
@@ -972,7 +1153,8 @@ int main(int argc, char *argv[])
 	/*
 	 * -n is refused at startup, structurally, not with a runtime warning.
 	 * send_filtered_data_to_peer() bails out UNFILTERED on NPD'd payloads
-	 * (udp.c:218-228) and only logs a rate-limited warning, which at 40 Mb/s is
+	 * (udp.c:218-228) and only logs a rate-limited warning, which at the measured
+	 * multiplex rate is
 	 * invisible. The consequence is serving the whole multiplex instead of one
 	 * service -- roughly 15x -- so this must not be survivable by inattention.
 	 */
