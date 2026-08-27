@@ -480,7 +480,7 @@ fi
 if systemctl is-active --quiet "$P8_UNIT"; then
     say "Verifying ${P8_UNIT} stops cleanly (D1 regression check)"
     _t0=$(date +%s%N)
-    systemctl stop "$P8_UNIT"
+    systemctl stop "$P8_UNIT" || warn "stop returned non-zero"
     _t1=$(date +%s%N)
     _ms=$(( (_t1 - _t0) / 1000000 ))
     _res="$(systemctl show -p Result --value "$P8_UNIT" 2>/dev/null)"
@@ -490,8 +490,8 @@ if systemctl is-active --quiet "$P8_UNIT"; then
         warn "stop took ${_ms} ms, Result=${_res} - D1 may have regressed"
     fi
     journalctl -u "$P8_UNIT" -n 20 --no-pager 2>/dev/null \
-        | grep -E "\[STOP\]" | sed 's/^/        /'
-    systemctl start "$P8_UNIT"
+        | { grep -E "\[STOP\]" || true; } | sed 's/^/        /'
+    systemctl start "$P8_UNIT" || warn "restart returned non-zero"
     sleep 2
     systemctl is-active --quiet "$P8_UNIT" && info "restarted, still active"
 fi
@@ -519,7 +519,7 @@ else
     _touched="$(grep -E '^[+-][^+-]' /tmp/part8-units-diff.txt | grep -vE 'part8' || true)"
     if [ -z "$_touched" ]; then
         info "ONLY part8-recovery lines differ - no existing rist* unit changed"
-        grep -E '^\+[^+]' /tmp/part8-units-diff.txt | sed 's/^/        /'
+        { grep -E '^\+[^+]' /tmp/part8-units-diff.txt || true; } | sed 's/^/        /'
     else
         warn "an EXISTING unit changed - this should not happen:"
         printf '%s\n' "$_touched" | sed 's/^/        /'
