@@ -95,11 +95,6 @@
  * either way, only the log lines are thinned. */
 #define DISC_LOG_MIN_GAP_US 1000000ULL
 
-/* The measured transponder rate: 59,145,890 b/s, agreed by PCR-delta-vs-byte-
- * offset, tsanalyze, and a separate 30 s capture. Used only for operator-facing
- * headroom figures, never for control decisions. */
-#define MEASURED_RATE_BPS   59145890ULL
-
 #define DEFAULT_BUFFER_MS   10000
 #define DEFAULT_RCVBUF      (32 * 1024 * 1024)
 #define DEFAULT_DEBUG_SOCK  "/tmp/part8_recovery.sock"
@@ -142,6 +137,40 @@ static uint64_t g_ts_packets_in = 0;
 static uint64_t g_bytes_in = 0;
 static uint64_t g_sync_errors = 0;
 static uint64_t g_requests_outside_buffer = 0;
+
+/* Identity and configuration reported to the GUI, so a panel can prove it is
+ * showing the instance it thinks it is rather than whichever socket answered. */
+static char     g_instance_name[64] = "default";
+static bool     g_require_selection = true;
+static int      g_rcvbuf_got = 0;
+static bool     g_rcvbuf_clamped = false;
+
+/*
+ * Recent-window input rate.
+ *
+ * Tripwire B judges against the LIFETIME average, which is right for it: a
+ * ceiling breach is about sustained rate. It is wrong for an operator display,
+ * where hours of healthy history would mask a feed that died ten minutes ago.
+ * Both are exposed, and neither is a compile-time constant -- each instance
+ * carries a different transponder and must derive its own.
+ */
+static double   g_rate_window_bps = 0.0;
+static uint64_t g_window_start_us = 0;
+static uint64_t g_window_start_bytes = 0;
+
+/* Per-peer figures lifted from the librist stats callback. Quality and RTT come
+ * free from it, so nothing here re-derives them. */
+#define MAX_TRACKED_PEERS 16
+struct peer_stat {
+	uint32_t id;
+	double   quality;
+	uint64_t rtt;
+	uint64_t retransmitted;
+	uint64_t sent;
+};
+static struct peer_stat g_peers[MAX_TRACKED_PEERS];
+static int g_peer_count = 0;
+static pthread_mutex_t peer_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Discontinuity event log (O3).
@@ -728,6 +757,50 @@ static int stats_cb(void *arg, const struct rist_stats *sc)
 	if ((k = strstr(q, "\"bytesize\":")) && sscanf(k + 11, "%llu", &v) == 1)
 		g_queue_bytesize = v;
 
+	/*
+	 * Per-peer figures for the GUI. These are already in the stats JSON, so they
+	 * are lifted rather than recomputed -- the sender-side peer array is keyed by
+	 * "peer_id" with "quality", "rtt" and "retransmitted" alongside.
+	 */
+	pthread_mutex_lock(&peer_lock);
+	g_peer_count = 0;
+	const char *pp = strstr(sc->stats_json, "\"peers\"");
+	const char *cur = pp ? pp : sc->stats_json;
+	while (g_peer_count < MAX_TRACKED_PEERS) {
+		const char *idk = strstr(cur, "\"peer_id\":");
+		if (!idk)
+			break;
+		struct peer_stat *ps = &g_peers[g_peer_count];
+		memset(ps, 0, sizeof(*ps));
+		unsigned long long uv; double dv;
+		if (sscanf(idk + 10, "%llu", &uv) == 1)
+			ps->id = (uint32_t)uv;
+		/* Bound each lookup to this peer's object so a field missing here does
+		 * not silently pick up the next peer's value. */
+		const char *nxt = strstr(idk + 10, "\"peer_id\":");
+		size_t span = nxt ? (size_t)(nxt - idk) : strlen(idk);
+		char *obj = malloc(span + 1);
+		if (!obj)
+			break;
+		memcpy(obj, idk, span);
+		obj[span] = '\0';
+		const char *f;
+		if ((f = strstr(obj, "\"quality\":")) && sscanf(f + 10, "%lf", &dv) == 1)
+			ps->quality = dv;
+		if ((f = strstr(obj, "\"rtt\":")) && sscanf(f + 6, "%llu", &uv) == 1)
+			ps->rtt = uv;
+		if ((f = strstr(obj, "\"retransmitted\":")) && sscanf(f + 16, "%llu", &uv) == 1)
+			ps->retransmitted = uv;
+		if ((f = strstr(obj, "\"sent\":")) && sscanf(f + 7, "%llu", &uv) == 1)
+			ps->sent = uv;
+		free(obj);
+		g_peer_count++;
+		if (!nxt)
+			break;
+		cur = nxt;
+	}
+	pthread_mutex_unlock(&peer_lock);
+
 	uint64_t threshold = SEQ_SPACE * TRIPWIRE_WARN_PCT / 100;
 	if (g_queue_size_max >= threshold && !g_tripwire_a_fired) {
 		g_tripwire_a_fired = true;
@@ -776,7 +849,18 @@ static void tripwire_rate_check(void)
 /* ---------------------------------------------------------------- logging */
 static void log_periodic(void)
 {
-	uint64_t elapsed = now_us() - g_start_us;
+	uint64_t nowu = now_us();
+	uint64_t elapsed = nowu - g_start_us;
+
+	/* Roll the recent-rate window. This is the figure the GUI shows; the
+	 * lifetime average below is what tripwire B judges against. */
+	if (g_window_start_us && nowu > g_window_start_us) {
+		g_rate_window_bps = (double)(g_bytes_in - g_window_start_bytes) * 8.0
+			* 1000000.0 / (double)(nowu - g_window_start_us);
+	}
+	g_window_start_us = nowu;
+	g_window_start_bytes = g_bytes_in;
+
 	double rate_bps = elapsed ? ((double)g_bytes_in * 8.0 * 1000000.0 / (double)elapsed) : 0.0;
 	double rtp_pps  = elapsed ? ((double)g_payloads_written * 1000000.0 / (double)elapsed) : 0.0;
 
@@ -790,6 +874,24 @@ static void log_periodic(void)
 		g_queue_size_now, g_queue_time_ms, (double)g_queue_bytesize / 1048576.0,
 		g_queue_size_max, g_queue_size_max * 100 / SEQ_SPACE,
 		g_requests_outside_buffer);
+
+	/* Headroom, from THIS instance's measured input. Logged once the rate is
+	 * real so the figure can never be a fleet-wide guess. */
+	if (rate_bps > 0.0) {
+		double rtp_pps = rate_bps / (188.0 * 8.0) / (double)TS_PER_RTP;
+		rist_log(&logging_settings, RIST_LOG_INFO,
+			"[HEADROOM] %s: %.2f Mb/s -> %.0f payloads/s; %d ms buffer projects "
+			"%.0f payloads (%.0f%% of %llu). Ceiling at %.1f s, warn at %.1f s. "
+			"Input buffer holds %.0f ms at this rate.\n",
+			g_instance_name, rate_bps / 1e6, rtp_pps, g_buffer_ms,
+			rtp_pps * g_buffer_ms / 1000.0,
+			rtp_pps * g_buffer_ms / 1000.0 * 100.0 / (double)SEQ_SPACE,
+			(unsigned long long)SEQ_SPACE,
+			rtp_pps > 0 ? (double)SEQ_SPACE / rtp_pps : 0.0,
+			rtp_pps > 0 ? (double)SEQ_SPACE * TRIPWIRE_WARN_PCT / 100.0 / rtp_pps : 0.0,
+			g_rcvbuf_got > 0 ? (double)g_rcvbuf_got / 1316.0 * 1316.0 * 8.0
+			                   / rate_bps * 1000.0 : 0.0);
+	}
 
 	pthread_mutex_lock(&catalogue_lock);
 	for (int pid = 0; pid < MAX_PIDS; pid++) {
@@ -815,19 +917,212 @@ static void log_periodic(void)
  */
 static char g_debug_path[108] = DEFAULT_DEBUG_SOCK;   /* sun_path is 108 */
 
-/* Write straight to the client instead of accumulating. `stats` lists one line
- * per PCR-bearing PID, and this multiplex has 33 of them; a fixed 1 KB buffer
- * silently dropped the tail, so anything reading the socket saw a short list
- * with no indication it had been cut. */
-static void debug_emit(int fd, const char *fmt, ...)
+/*
+ * A growable response buffer.
+ *
+ * The previous version wrote straight to the client socket. That fixed the 1 KB
+ * truncation but introduced something worse: `stats` and `events` wrote while
+ * holding catalogue_lock / disc_lock, and those are the locks emit_payload takes
+ * for every PCR-bearing packet. A client that stops reading -- a wedged poller,
+ * a stalled pipe -- blocks write() with the lock held and stalls INGEST. It
+ * never showed with a hand-run `nc` and 33 short lines, and it is exactly the
+ * failure mode of a test fixture promoted to a production dependency.
+ *
+ * So: build the response in memory, hold the lock only long enough to copy
+ * state, and write after releasing it.
+ */
+struct dbuf {
+	char  *p;
+	size_t len, cap;
+	bool   oom;
+};
+
+static void dbuf_add(struct dbuf *b, const char *fmt, ...)
 {
-	char buf[512];
-	va_list ap;
-	va_start(ap, fmt);
-	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
-	if (n > 0)
-		(void)!write(fd, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
+	if (b->oom)
+		return;
+	for (int attempt = 0; attempt < 2; attempt++) {
+		size_t avail = b->cap > b->len ? b->cap - b->len : 0;
+		va_list ap;
+		va_start(ap, fmt);
+		int n = vsnprintf(b->p ? b->p + b->len : NULL, avail, fmt, ap);
+		va_end(ap);
+		if (n < 0) { b->oom = true; return; }
+		if ((size_t)n < avail) { b->len += (size_t)n; return; }
+		size_t want = b->cap ? b->cap : 8192;
+		while (want < b->len + (size_t)n + 1)
+			want *= 2;
+		char *np = realloc(b->p, want);
+		if (!np) { b->oom = true; return; }
+		b->p = np;
+		b->cap = want;
+	}
+}
+
+/*
+ * Write the whole response, tolerating a client that goes away mid-transfer.
+ *
+ * A GUI poller that times out and closes leaves this end with a half-written
+ * response. Without SIGPIPE ignored that KILLS THE SERVER -- and the bigger the
+ * response the likelier it is, so the JSON document made a latent crash into a
+ * reachable one. A stats reader must never be able to take down the recovery
+ * path: the write is bounded by SO_SNDTIMEO, a partial write is retried, and
+ * EPIPE just abandons this client.
+ */
+static void dbuf_write_all(int fd, const char *p, size_t len)
+{
+	size_t off = 0;
+	while (off < len) {
+		ssize_t w = write(fd, p + off, len - off);
+		if (w > 0) { off += (size_t)w; continue; }
+		if (w < 0 && errno == EINTR)
+			continue;
+		break;                  /* EPIPE, EAGAIN on timeout, or a closed peer */
+	}
+}
+
+static void dbuf_flush(struct dbuf *b, int fd)
+{
+	if (b->oom) {
+		static const char err[] = "{\"error\":\"out of memory building response\"}\n";
+		dbuf_write_all(fd, err, sizeof(err) - 1);
+	} else if (b->p && b->len) {
+		dbuf_write_all(fd, b->p, b->len);
+	}
+	free(b->p);
+	b->p = NULL; b->len = b->cap = 0;
+}
+
+/* JSON string escaping: instance names and free-text notes reach the GUI here. */
+static void dbuf_json_str(struct dbuf *b, const char *s)
+{
+	dbuf_add(b, "\"");
+	for (; s && *s; s++) {
+		unsigned char c = (unsigned char)*s;
+		if (c == '"' || c == '\\')  dbuf_add(b, "\\%c", c);
+		else if (c == '\n')         dbuf_add(b, "\\n");
+		else if (c == '\r')         dbuf_add(b, "\\r");
+		else if (c == '\t')         dbuf_add(b, "\\t");
+		else if (c < 0x20)          dbuf_add(b, "\\u%04x", c);
+		else                        dbuf_add(b, "%c", c);
+	}
+	dbuf_add(b, "\"");
+}
+
+/*
+ * The GUI's stats interface.
+ *
+ * One document, one round trip, everything a per-instance panel needs. Every
+ * rate and every headroom figure here is derived from THIS instance's own
+ * measured input -- there is no shared constant. A second transponder running at
+ * a different rate gets different numbers, which is the point: a fleet-wide
+ * constant would make the headroom silently wrong for every transponder that is
+ * not the one it was measured on.
+ */
+static void emit_json(int fd)
+{
+	uint64_t now = now_us();
+	uint64_t elapsed = now - g_start_us;
+
+	/* Lifetime average: what tripwire B judges against. */
+	double life_bps = elapsed
+		? (double)g_bytes_in * 8.0 * 1000000.0 / (double)elapsed : 0.0;
+	/* Recent window: what an operator needs, because a lifetime average hides a
+	 * feed that stopped ten minutes ago behind hours of healthy history. */
+	double win_bps = g_rate_window_bps;
+
+	double basis_bps = win_bps > 0.0 ? win_bps : life_bps;
+	double rtp_pps   = basis_bps / (188.0 * 8.0) / (double)TS_PER_RTP;
+	double projected = rtp_pps * ((double)g_buffer_ms / 1000.0);
+	double safe_s    = rtp_pps > 0.0 ? (double)SEQ_SPACE / rtp_pps : 0.0;
+	double warn_s    = rtp_pps > 0.0
+		? (double)SEQ_SPACE * TRIPWIRE_WARN_PCT / 100.0 / rtp_pps : 0.0;
+
+	struct dbuf b = { 0 };
+	dbuf_add(&b, "{\"schema\":1,\"instance\":");
+	dbuf_json_str(&b, g_instance_name);
+	dbuf_add(&b, ",\"uptime_s\":%.1f,\"buffer_ms\":%d,\"require_selection\":%s,"
+		"\"ceiling_payloads\":%llu,",
+		(double)elapsed / 1e6, g_buffer_ms,
+		g_require_selection ? "true" : "false",
+		(unsigned long long)SEQ_SPACE);
+
+	/* (1) input bitrate. RIST reports what it SENDS, never what arrives, so this
+	 * is measured here and exposed rather than computed a second time. */
+	dbuf_add(&b, "\"input\":{\"ts_packets\":%" PRIu64 ",\"bytes\":%" PRIu64
+		",\"sync_errors\":%" PRIu64 ",\"payloads_written\":%" PRIu64
+		",\"ext_seq\":%" PRIu64 ",\"rate_bps_window\":%.0f"
+		",\"rate_bps_lifetime\":%.0f,\"rtp_pps\":%.1f"
+		",\"rcvbuf_bytes\":%d,\"rcvbuf_clamped\":%s},",
+		g_ts_packets_in, g_bytes_in, g_sync_errors, g_payloads_written,
+		g_ext_seq, win_bps, life_bps, rtp_pps,
+		g_rcvbuf_got, g_rcvbuf_clamped ? "true" : "false");
+
+	/* Buffer health: read straight from librist's stats callback, not re-derived.
+	 * safe_buffer_s / warn_buffer_s are THIS instance's ceiling arithmetic. */
+	dbuf_add(&b, "\"buffer\":{\"payloads\":%" PRIu64 ",\"payloads_max\":%" PRIu64
+		",\"ms\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"pct_of_ceiling\":%.2f"
+		",\"have_stats\":%s,\"projected_payloads\":%.0f"
+		",\"safe_buffer_s\":%.1f,\"warn_buffer_s\":%.1f},",
+		g_queue_size_now, g_queue_size_max, g_queue_time_ms, g_queue_bytesize,
+		100.0 * (double)g_queue_size_now / (double)SEQ_SPACE,
+		g_have_queue_stats ? "true" : "false", projected, safe_s, warn_s);
+
+	dbuf_add(&b, "\"tripwires\":{\"a\":%s,\"b\":%s,\"outside_buffer\":%" PRIu64 "},",
+		g_tripwire_a_fired ? "true" : "false",
+		g_tripwire_b_fired ? "true" : "false", g_requests_outside_buffer);
+
+	/* Peers: count, quality and RTT come free from the stats callback. */
+	pthread_mutex_lock(&peer_lock);
+	dbuf_add(&b, "\"peers\":{\"count\":%d,\"list\":[", g_peer_count);
+	for (int i = 0; i < g_peer_count && i < MAX_TRACKED_PEERS; i++)
+		dbuf_add(&b, "%s{\"id\":%u,\"quality\":%.2f,\"rtt_ms\":%" PRIu64
+			",\"retransmitted\":%" PRIu64 ",\"sent\":%" PRIu64 "}",
+			i ? "," : "", g_peers[i].id, g_peers[i].quality, g_peers[i].rtt,
+			g_peers[i].retransmitted, g_peers[i].sent);
+	dbuf_add(&b, "]},");
+	pthread_mutex_unlock(&peer_lock);
+
+	/* (2) catalogue health -- Part 8 specific, exists nowhere else. */
+	pthread_mutex_lock(&catalogue_lock);
+	size_t npids = 0, entries = 0;
+	dbuf_add(&b, "\"catalogue\":{\"pids\":[");
+	for (int pid = 0; pid < MAX_PIDS; pid++) {
+		struct pcr_ring *r = rings[pid];
+		if (!r || r->count == 0) continue;
+		dbuf_add(&b, "%s{\"pid\":%d,\"depth\":%zu,\"total\":%" PRIu64
+			",\"epoch\":%" PRIu32 "}", npids ? "," : "",
+			pid, r->count, r->total_entries, r->epoch);
+		npids++;
+		entries += r->count;
+	}
+	dbuf_add(&b, "],\"pid_count\":%zu,\"entries\":%zu},", npids, entries);
+	pthread_mutex_unlock(&catalogue_lock);
+
+	/* (3) discontinuity events. Section 7 is still open and a real field
+	 * discontinuity is what we are waiting for, so it must not be buried. */
+	pthread_mutex_lock(&disc_lock);
+	uint64_t total = g_disc_total;
+	size_t n = total < DISC_LOG_CAP ? (size_t)total : DISC_LOG_CAP;
+	size_t show = n < 32 ? n : 32;
+	dbuf_add(&b, "\"discontinuities\":{\"total\":%" PRIu64
+		",\"indicator_nopcr\":%" PRIu64 ",\"recent\":[",
+		total, g_disc_indicator_nopcr);
+	for (size_t i = 0; i < show; i++) {
+		size_t idx = (g_disc_head + DISC_LOG_CAP - show + i) % DISC_LOG_CAP;
+		struct disc_event *e = &g_disc[idx];
+		dbuf_add(&b, "%s{\"at\":%" PRIu64 ",\"pid\":%u,\"kind\":\"%s\""
+			",\"epoch\":%" PRIu32 ",\"pcr_before\":%" PRIu64
+			",\"pcr_after\":%" PRIu64 ",\"delta_ticks\":%" PRId64
+			",\"delta_ms\":%.1f,\"ext_seq\":%" PRIu64 "}",
+			i ? "," : "", e->wall_real, e->pid, disc_kind_str(e->kind),
+			e->epoch, e->pcr_before, e->pcr_after, e->delta,
+			(double)e->delta * 1000.0 / (double)PCR_HZ, e->ext_seq);
+	}
+	dbuf_add(&b, "]}}\n");
+	pthread_mutex_unlock(&disc_lock);
+
+	dbuf_flush(&b, fd);
 }
 
 static void debug_handle(int fd, const char *line)
@@ -877,7 +1172,12 @@ static void debug_handle(int fd, const char *line)
 				rr.note[0] ? rr.note : "-");
 		}
 	} else if (strncmp(line, "stats", 5) == 0) {
-		debug_emit(fd,
+		/*
+		 * Text form, kept because the validation harness parses it. The GUI uses
+		 * `json` instead. Both snapshot under the lock and write after it.
+		 */
+		struct dbuf b = {0};
+		dbuf_add(&b,
 			"ext_seq=%" PRIu64 " payloads=%" PRIu64 " ts_in=%" PRIu64
 			" queue_now=%" PRIu64 " queue_max=%" PRIu64 " queue_ms=%" PRIu64
 			" queue_bytes=%" PRIu64 " ceiling=%llu outside_buffer=%" PRIu64
@@ -891,27 +1191,31 @@ static void debug_handle(int fd, const char *line)
 		pthread_mutex_lock(&catalogue_lock);
 		for (int pid = 0; pid < MAX_PIDS; pid++) {
 			if (!rings[pid] || rings[pid]->count == 0) continue;
-			debug_emit(fd, "pid 0x%04X depth=%zu total=%" PRIu64 " epoch=%" PRIu32 "\n",
+			dbuf_add(&b, "pid 0x%04X depth=%zu total=%" PRIu64 " epoch=%" PRIu32 "\n",
 				pid, rings[pid]->count, rings[pid]->total_entries, rings[pid]->epoch);
 		}
 		pthread_mutex_unlock(&catalogue_lock);
-		return;                     /* already written, in full */
+		dbuf_flush(&b, fd);
+		return;
+	} else if (strncmp(line, "json", 4) == 0) {
+		emit_json(fd);
+		return;
 	} else if (strncmp(line, "events", 6) == 0) {
 		/*
 		 * The discontinuity ring (O3). Reported after the fact on purpose: the
 		 * point is to be able to resolve either side of a real discontinuity
 		 * once one occurs, without having to catch it live in the journal.
 		 */
+		struct dbuf b = {0};
 		pthread_mutex_lock(&disc_lock);
 		uint64_t total = g_disc_total;
 		size_t n = total < DISC_LOG_CAP ? (size_t)total : DISC_LOG_CAP;
-		debug_emit(fd, "disc_total=%" PRIu64 " indicator_nopcr=%" PRIu64
+		dbuf_add(&b, "disc_total=%" PRIu64 " indicator_nopcr=%" PRIu64
 			" shown=%zu cap=%d\n", total, g_disc_indicator_nopcr, n, DISC_LOG_CAP);
 		for (size_t i = 0; i < n; i++) {
-			/* oldest first */
 			size_t idx = (g_disc_head + DISC_LOG_CAP - n + i) % DISC_LOG_CAP;
 			struct disc_event *e = &g_disc[idx];
-			debug_emit(fd,
+			dbuf_add(&b,
 				"event real=%" PRIu64 " mono_us=%" PRIu64 " pid=0x%04X kind=%s"
 				" epoch=%" PRIu32 " pcr_before=%" PRIu64 " pcr_after=%" PRIu64
 				" delta=%" PRId64 " ext_seq=%" PRIu64 "\n",
@@ -919,12 +1223,13 @@ static void debug_handle(int fd, const char *line)
 				e->epoch, e->pcr_before, e->pcr_after, e->delta, e->ext_seq);
 		}
 		pthread_mutex_unlock(&disc_lock);
+		dbuf_flush(&b, fd);
 		return;
 	} else {
 		snprintf(out, sizeof(out),
-			"ERR usage: 'resolve <pid> <pcr_base> <duration_ticks>' | 'stats' | 'events'\n");
+			"ERR usage: 'resolve <pid> <pcr_base> <duration_ticks>' | 'stats' | 'events' | 'json'\n");
 	}
-	(void)!write(fd, out, strlen(out));
+	dbuf_write_all(fd, out, strlen(out));
 }
 
 static void *debug_thread(void *arg)
@@ -975,6 +1280,11 @@ static void *debug_thread(void *arg)
 
 		int c = accept(srv, NULL, NULL);
 		if (c < 0) { if (running && errno != EINTR) usleep(100000); continue; }
+		/* The accept loop is single-threaded: without a bound, one client that
+		 * stops reading would park it and every other poller with it. */
+		struct timeval sto = { .tv_sec = 2, .tv_usec = 0 };
+		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof(sto));
+		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &sto, sizeof(sto));
 		char buf[512];
 		ssize_t n = read(c, buf, sizeof(buf) - 1);
 		if (n > 0) { buf[n] = '\0'; debug_handle(c, buf); }
@@ -1022,19 +1332,25 @@ static int open_input(const char *host, int port, int want_rcvbuf)
 	}
 
 	/*
-	 * The holding time below is quoted against MEASURED_RATE_BPS, not against a
-	 * guess. An earlier version of this line said "at 40 Mb/s", which was an
-	 * estimate 48% below the real transponder rate and therefore overstated the
-	 * headroom by the same margin. If the feed rate changes, change the constant
-	 * -- do not leave a stale figure in an operator-facing log line.
+	 * No holding time is quoted here, and that is deliberate.
+	 *
+	 * This line used to say "at 40 Mb/s" -- an estimate 48% below the real rate,
+	 * which overstated the headroom by the same margin. Replacing it with the
+	 * measured 59.1 Mb/s fixed THIS transponder and would silently break every
+	 * other one, because a second instance carries a different multiplex at a
+	 * different rate. There is nothing to measure yet at bind time, so the
+	 * capacity is reported in datagrams -- which is rate-independent and true --
+	 * and the time it represents is logged by the periodic status once this
+	 * instance has measured its own input.
 	 */
+	g_rcvbuf_got = got;
+	g_rcvbuf_clamped = (got < want_rcvbuf);
 	double datagrams = (double)got / 1316.0;
 	rist_log(&logging_settings, RIST_LOG_INFO,
 		"[INPUT] bound :%d  SO_RCVBUF requested %d -> kernel reports %d bytes "
-		"(~%.0f datagrams of 1316, ~%.0f ms at %.1f Mb/s)%s\n",
+		"(~%.0f datagrams of 1316; holding time follows once the rate is "
+		"measured from this input)%s\n",
 		port, want_rcvbuf, got, datagrams,
-		datagrams * 1316.0 * 8.0 / (double)MEASURED_RATE_BPS * 1000.0,
-		(double)MEASURED_RATE_BPS / 1e6,
 		got < want_rcvbuf ? "  << CLAMPED, raise net.core.rmem_max" : "");
 	if (got < want_rcvbuf)
 		rist_log(&logging_settings, RIST_LOG_WARN,
@@ -1116,6 +1432,7 @@ static void usage(const char *me)
 		"  -b MS        retransmit buffer target, default %d\n"
 		"  -r BYTES     SO_RCVBUF request, default %d\n"
 		"  -d PATH      debug unix socket, default %s\n"
+		"  -N NAME      instance name, reported in stats and logs\n"
 		"  -S           do NOT require a registered content selection (unsafe)\n"
 		"  -v           verbose\n", me, DEFAULT_BUFFER_MS, DEFAULT_RCVBUF, DEFAULT_DEBUG_SOCK);
 }
@@ -1128,13 +1445,14 @@ int main(int argc, char *argv[])
 	bool saw_npd = false;
 	int c;
 
-	while ((c = getopt(argc, argv, "i:o:b:r:d:Snvh")) != -1) {
+	while ((c = getopt(argc, argv, "i:o:b:r:d:N:Snvh")) != -1) {
 		switch (c) {
 		case 'i': inurl  = strdup(optarg); break;
 		case 'o': outurl = strdup(optarg); break;
 		case 'b': g_buffer_ms = atoi(optarg); break;
 		case 'r': rcvbuf = atoi(optarg); break;
 		case 'd': snprintf(g_debug_path, sizeof(g_debug_path), "%s", optarg); break;
+		case 'N': snprintf(g_instance_name, sizeof(g_instance_name), "%s", optarg); break;
 		case 'S': require_selection = false; break;
 		case 'n': saw_npd = true; break;
 		case 'v': logging_settings.log_level = RIST_LOG_DEBUG; break;
@@ -1173,6 +1491,9 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "pipe() failed: %s\n", strerror(errno));
 		return 1;
 	}
+	/* A stats client that hangs up mid-response must not be able to kill the
+	 * recovery path. Writes report EPIPE instead and are handled locally. */
+	signal(SIGPIPE, SIG_IGN);
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
@@ -1206,6 +1527,7 @@ int main(int argc, char *argv[])
 	/* P1(a): refuse retransmission to any peer that has not declared what it is
 	 * watching. Opt-in flag, default-off in librist, so the Part 6/7 units are
 	 * bit-identical -- only this process sets it. */
+	g_require_selection = require_selection;
 	if (require_selection) {
 		if (rist_sender_require_selection_enable(sender_ctx) != 0)
 			rist_log(&logging_settings, RIST_LOG_WARN,
