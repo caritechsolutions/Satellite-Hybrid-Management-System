@@ -1,0 +1,48 @@
+[Unit]
+# Templated: one instance per transponder. Everything that could collide between
+# instances is derived from %i -- config file, debug socket, runtime and state
+# directories, journal identity -- so two instances share nothing but the binary.
+Description=VSF TR-06-4 Part 8 recovery server (%i)
+Documentation=https://github.com/caritechsolutions/Satellite-Hybrid-Management-System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/part8/instances/%i.env
+
+# /run/part8-recovery/%i and /var/lib/part8-recovery/%i, created and cleaned up
+# by systemd. The debug socket lives in the former, per instance.
+RuntimeDirectory=part8-recovery/%i
+RuntimeDirectoryMode=0755
+StateDirectory=part8-recovery/%i
+WorkingDirectory=/var/lib/part8-recovery/%i
+
+# A newly created instance starts life as UNCONFIGURED on purpose. Refuse to
+# start rather than busy-loop against a placeholder address.
+ExecStartPre=/bin/sh -c '[ "$P8_INPUT" != "UNCONFIGURED" ] || { echo "P8_INPUT not set in /etc/part8/instances/%i.env"; exit 1; }'
+
+ExecStart=/bin/sh -c 'exec /usr/local/bin/part8_recovery_server \
+    -i "$P8_INPUT" \
+    -o "$P8_LISTEN" \
+    -b "$P8_BUFFER_MS" \
+    -r "$P8_RCVBUF" \
+    -N "%i" \
+    -d /run/part8-recovery/%i/debug.sock \
+    $P8_EXTRA'
+
+# D1 (blocking accept in the debug thread) is fixed, so SIGTERM is honoured and
+# shutdown completes in milliseconds. The short timeout is deliberate: if this
+# ever needs the full grace period again, that hang has returned.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=part8-%i
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,149 @@
+#!/bin/bash
+#
+# part8-unit - root helper for the Part 8 management UI.
+#
+# SEPARATE FROM rist-unit ON PURPOSE. The Part 7 helper is not widened and not
+# reused: this one exists so that the Part 8 app never needs, and never gets, a
+# systemctl grant of its own.
+#
+# The caller passes an ACTION and an INSTANCE TOKEN. It never passes a unit
+# name. This script validates the token and then CONSTRUCTS
+# part8-recovery@<token>.service itself, so there is no spelling of the argument
+# that reaches a different unit -- not "ristsender-bbc", not
+# "part8-recovery@x.service ristsender-bbc", not a path, not an escaped
+# instance. Filtering a caller-supplied unit name would leave that class open;
+# constructing the name removes it.
+#
+# Actions that write config also record the before/after state of every rist*
+# and part8* unit, so if anything outside Part 8 ever changes it is visible
+# afterwards rather than inferred.
+set -e
+
+ACTION="${1:-}"
+NAME="${2:-}"
+
+UNIT_TEMPLATE="part8-recovery@"
+ENV_DIR="/etc/part8/instances"
+STATE_DIR="/var/lib/part8-monitor"
+
+die() { echo "$*" >&2; exit 1; }
+
+# Instance tokens: lowercase alphanumeric and hyphen, must start alphanumeric,
+# 1-31 chars. No dot (would let ".service" through), no slash, no '@', no
+# systemd escape sequences, nothing that can traverse a path.
+valid_name() {
+    case "$1" in
+        ""|*[!a-z0-9-]*) return 1 ;;
+        [!a-z0-9]*)      return 1 ;;
+    esac
+    [ "${#1}" -le 31 ] || return 1
+    return 0
+}
+
+snapshot() {
+    {
+        systemctl list-units --type=service --all --plain --no-legend 'rist*' 'part8*' 2>/dev/null \
+            | awk '{print $1, $2, $3, $4}'
+        echo "---enabled---"
+        systemctl list-unit-files --no-legend 'rist*' 'part8*' 2>/dev/null | awk '{print $1, $2}'
+        echo "---mainpid---"
+        for u in $(systemctl list-units --type=service --all --plain --no-legend 'rist*' 2>/dev/null | awk '{print $1}'); do
+            printf '%s %s\n' "$u" "$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
+        done
+    } 2>/dev/null | sort
+}
+
+# Compare two snapshots and report any line that changed and is NOT a part8 unit.
+# This is the check that matters: the requirement is that Part 7 keeps working,
+# so a change to a Part 7 unit is reported loudly rather than assumed impossible.
+report_diff() {
+    local before="$1" after="$2"
+    local touched
+    touched="$(diff "$before" "$after" 2>/dev/null | grep -E '^[<>]' | grep -v 'part8' || true)"
+    if [ -n "$touched" ]; then
+        echo "PART7-CHANGED"
+        printf '%s\n' "$touched"
+    else
+        echo "PART7-UNCHANGED"
+    fi
+}
+
+[ "$(id -u)" -eq 0 ] || die "part8-unit must run as root"
+
+case "$ACTION" in
+    list)
+        systemctl list-units --type=service --all --plain --no-legend 'part8-recovery@*' 2>/dev/null \
+            | awk '{print $1, $3, $4}'
+        exit 0
+        ;;
+    snapshot)
+        snapshot
+        exit 0
+        ;;
+esac
+
+case "$ACTION" in
+    create|remove|start|stop|restart|enable|disable|status|journal) ;;
+    *) die "usage: part8-unit {create|remove|start|stop|restart|enable|disable|status|journal} <instance> | list | snapshot" ;;
+esac
+
+valid_name "$NAME" || die "refusing instance name: '${NAME}' (need ^[a-z0-9][a-z0-9-]{0,30}\$)"
+UNIT="${UNIT_TEMPLATE}${NAME}.service"
+# Printed so a test can assert what was actually targeted. A token that LOOKS
+# like a Part 7 unit ("ristsender-bbc") is a legal token and is accepted -- and
+# is harmless, because it becomes part8-recovery@ristsender-bbc.service, not
+# ristsender-bbc.service. That is the difference between constructing the name
+# and filtering it, and it is why filtering was not used.
+[ -n "${P8_UNIT_ECHO:-}" ] && echo "UNIT=${UNIT}"
+
+mkdir -p "$STATE_DIR"
+BEFORE="$(mktemp)"; AFTER="$(mktemp)"
+trap 'rm -f "$BEFORE" "$AFTER"' EXIT
+
+case "$ACTION" in
+    start|stop|restart|enable|disable)
+        snapshot > "$BEFORE"
+        systemctl "$ACTION" "$UNIT" || die "systemctl ${ACTION} ${UNIT} failed"
+        snapshot > "$AFTER"
+        report_diff "$BEFORE" "$AFTER"
+        ;;
+
+    status)
+        systemctl is-active "$UNIT" 2>/dev/null || true
+        systemctl is-enabled "$UNIT" 2>/dev/null || true
+        ;;
+
+    create)
+        # Config arrives on stdin so no value ever passes through a command line
+        # and into a process listing or the shell's word splitting.
+        [ -d "$ENV_DIR" ] || mkdir -p "$ENV_DIR"
+        snapshot > "$BEFORE"
+        tmp="$(mktemp)"
+        cat > "$tmp"
+        grep -qE '^P8_INPUT=' "$tmp"  || { rm -f "$tmp"; die "config missing P8_INPUT"; }
+        grep -qE '^P8_LISTEN=' "$tmp" || { rm -f "$tmp"; die "config missing P8_LISTEN"; }
+        install -m 0644 -o root -g root "$tmp" "${ENV_DIR}/${NAME}.env"
+        rm -f "$tmp"
+        systemctl daemon-reload
+        snapshot > "$AFTER"
+        report_diff "$BEFORE" "$AFTER"
+        ;;
+
+    remove)
+        snapshot > "$BEFORE"
+        systemctl stop "$UNIT" 2>/dev/null || true
+        systemctl disable "$UNIT" 2>/dev/null || true
+        rm -f "${ENV_DIR}/${NAME}.env"
+        systemctl daemon-reload
+        snapshot > "$AFTER"
+        report_diff "$BEFORE" "$AFTER"
+        ;;
+
+    journal)
+        journalctl -u "$UNIT" -n "${3:-80}" --no-pager --output=short-iso 2>/dev/null || true
+        ;;
+
+    *)
+        die "usage: part8-unit {create|remove|start|stop|restart|enable|disable|status|journal} <instance> | list | snapshot"
+        ;;
+esac
