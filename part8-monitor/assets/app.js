@@ -184,14 +184,17 @@ function renderMetrics(card, row, s) {
     p.count ? `mean quality ${q.toFixed(1)}%` : 'none attached',
     p.count ? (q < 95 ? 'warn' : 'ok') : '');
 
-  // Occupancy AGAINST capacity. Occupancy alone reads as a large constant once
-  // every ring is at cap, and would look identical if the catalogue had stalled.
+  // SERVABLE, not occupancy. The ring holds far more history than the buffer can
+  // serve, so occupancy saturates at 100% within a minute and then never moves --
+  // it would read the same if ingest had stopped. Servable tracks the buffer and
+  // changes; history says how far back the catalogue can still answer "I had
+  // that, it aged out" rather than "no such PID".
   const cat = s.catalogue;
-  const capPct = cat.capacity ? (100 * cat.entries / cat.capacity) : 0;
+  const sv = cat.servable || 0;
   setMetric(card, 'cat', `${cat.pid_count} PIDs`,
-    `${cat.entries.toLocaleString()} / ${(cat.capacity || 0).toLocaleString()} entries` +
-    (cat.capacity ? ` (${capPct.toFixed(0)}% of ring capacity)` : ''),
-    cat.pid_count ? '' : 'warn');
+    `${sv.toLocaleString()} servable of ${(cat.entries || 0).toLocaleString()} held` +
+    (cat.history_ms ? ` · ${(cat.history_ms / 1000).toFixed(0)} s history` : ''),
+    cat.pid_count ? (sv ? '' : 'warn') : 'warn');
 
   const t = s.tripwires;
   setMetric(card, 'trip', (t.a || t.b) ? [t.a && 'A', t.b && 'B'].filter(Boolean).join('+') : 'clear',
@@ -214,9 +217,13 @@ function renderPanels(card, row, s) {
 
   if (which === 'peers') {
     peers.innerHTML = s.peers.list.length
-      ? '<table><tr><th>peer</th><th>quality</th><th>RTT ms</th><th>retransmitted</th><th>sent</th></tr>'
-        + s.peers.list.map(p => `<tr><td>${p.id}</td><td class="num">${p.quality.toFixed(2)}</td>`
-          + `<td class="num">${p.rtt_ms}</td><td class="num">${p.retransmitted}</td>`
+      ? '<table><tr><th>peer</th><th>cname</th><th>type</th><th>quality</th>'
+        + '<th>RTT ms</th><th>avg RTT</th><th>retransmitted</th><th>sent</th></tr>'
+        + s.peers.list.map(p => `<tr><td>${p.id}</td><td>${esc(p.cname || '-')}</td>`
+          + `<td>${esc(p.type || '-')}</td><td class="num">${p.quality.toFixed(1)}</td>`
+          + `<td class="num">${p.rtt_ms.toFixed(2)}</td>`
+          + `<td class="num">${(p.avg_rtt_ms || 0).toFixed(2)}</td>`
+          + `<td class="num">${p.retransmitted}</td>`
           + `<td class="num">${p.sent}</td></tr>`).join('') + '</table>'
       : '<p class="empty">No peers attached. With selection required, a receiver '
         + 'must register a Part 6 content selection or it gets nothing.</p>';

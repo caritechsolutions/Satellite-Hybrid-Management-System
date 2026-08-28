@@ -165,10 +165,16 @@ static uint64_t g_window_start_bytes = 0;
 #define MAX_TRACKED_PEERS 16
 struct peer_stat {
 	uint32_t id;
+	char     cname[64];
+	char     type[8];            /* "data" or "rtcp" */
 	double   quality;
-	uint64_t rtt;
+	double   rtt_ms;
+	double   avg_rtt_ms;
 	uint64_t retransmitted;
 	uint64_t sent;
+	uint64_t received;
+	uint64_t bandwidth;
+	uint64_t last_seen_us;       /* for expiry: a peer that stops reporting is gone */
 };
 static struct peer_stat g_peers[MAX_TRACKED_PEERS];
 static int g_peer_count = 0;
@@ -498,6 +504,7 @@ enum resolve_status {
 	RESOLVE_NO_ENTRY,          /* ring exists but every epoch came up empty */
 	RESOLVE_BEFORE_EPOCH,      /* request predates the epoch we resolved into */
 	RESOLVE_OUTSIDE_BUFFER,    /* nearest PCR lies further away than the buffer */
+	RESOLVE_TOO_OLD,           /* found it, but it has aged out of the buffer */
 };
 
 static const char *resolve_status_str(enum resolve_status s)
@@ -509,6 +516,7 @@ static const char *resolve_status_str(enum resolve_status s)
 	case RESOLVE_NO_ENTRY:       return "NO_ENTRY";
 	case RESOLVE_BEFORE_EPOCH:   return "BEFORE_EPOCH";
 	case RESOLVE_OUTSIDE_BUFFER: return "OUTSIDE_BUFFER";
+	case RESOLVE_TOO_OLD:        return "TOO_OLD";
 	}
 	return "UNKNOWN";
 }
@@ -526,8 +534,41 @@ struct resolve_result {
 	uint8_t  slot;
 	bool     end_estimated;      /* live edge: end came from the rate fallback */
 	int64_t  pcr_error;          /* actual - requested, signed ticks */
-	char     note[160];
+	char     note[256];
 };
+
+/*
+ * How many of the most recent payloads are still in librist's retransmission
+ * buffer, and therefore still servable.
+ *
+ * Preferred source is librist's own reported queue size -- our estimate of it is
+ * the thing that could be wrong. Before the first stats callback, or while no
+ * peer is attached and the queue is genuinely empty, fall back to what the
+ * measured input rate says WOULD be resident, so the interface stays usable for
+ * diagnosis rather than declaring everything unservable.
+ */
+static uint64_t resident_payloads(bool *estimated)
+{
+	if (g_have_queue_stats && g_queue_size_now) {
+		if (estimated) *estimated = false;
+		return g_queue_size_now;
+	}
+	/*
+	 * Fallback uses the LIFETIME rate, not the recent window. The window decays
+	 * the moment input pauses, which shrinks the estimate and makes recent,
+	 * genuinely servable entries look aged out -- a false TOO_OLD is a refusal
+	 * of a request that would have worked. The lifetime average is steady.
+	 *
+	 * This path only matters with no peer attached, where librist is holding
+	 * nothing anyway and the figure is for diagnosis rather than a serving
+	 * decision; once a peer is attached, g_queue_size_now above is exact.
+	 */
+	if (estimated) *estimated = true;
+	uint64_t el = now_us() - g_start_us;
+	double bps = el ? (double)g_bytes_in * 8.0 * 1000000.0 / (double)el : 0.0;
+	double pps = bps / (188.0 * 8.0) / (double)TS_PER_RTP;
+	return (uint64_t)(pps * (double)g_buffer_ms / 1000.0);
+}
 
 /* The single test a retransmission path should make. */
 static inline bool resolve_serviceable(const struct resolve_result *rr)
@@ -686,6 +727,54 @@ static struct resolve_result resolve(uint16_t pid, uint64_t base, uint64_t durat
 			"%d ms buffer -- outside the catalogue",
 			err_abs, (double)err_abs * 1000.0 / (double)PCR_HZ, g_buffer_ms);
 	}
+	/*
+	 * AGE AGAINST THE LIVE EDGE. This is a separate question from everything
+	 * above and neither of those checks answers it.
+	 *
+	 * err_abs says how close we got to the PCR that was asked for. It says
+	 * nothing about whether that entry can still be SERVED. The catalogue ring
+	 * deliberately holds far more history than the retransmission buffer -- 2048
+	 * entries is 39-81 s of PCRs against a 4 s buffer -- so an EXACT hit on a
+	 * 40-second-old entry gives err_abs == 0, passes every distance check, and
+	 * returns a sequence number librist dropped 36 seconds earlier. Measured: at
+	 * a 1000 ms buffer a request 3.98 s stale returned OK with start_ext 19.
+	 *
+	 * The authoritative measure is payload residency, not time: librist holds
+	 * the newest N payloads, so anything older than (live edge - N) is gone
+	 * whatever the clock says.
+	 */
+	if (rr.status == RESOLVE_OK) {
+		bool est = false;
+		uint64_t resident = resident_payloads(&est);
+		if (est) {
+			/*
+			 * Residency is only knowable from librist, and librist holds nothing
+			 * until a peer attaches. Deriving a threshold from the input rate
+			 * instead was tried and abandoned: on a bench the rate average is
+			 * diluted by idle periods, and the fabricated threshold produced
+			 * FALSE TOO_OLD verdicts on entries that were well inside the buffer
+			 * -- refusing requests that would have worked. An unchecked answer
+			 * that says so is better than a confident wrong one.
+			 */
+			size_t n = strlen(rr.note);
+			snprintf(rr.note + n, sizeof(rr.note) - n,
+				"%sage NOT checked: no peer attached, so nothing is resident and "
+				"residency cannot be measured", n ? "; " : "");
+		} else if (g_ext_seq > start->ext_seq &&
+		           (g_ext_seq - start->ext_seq) > resident) {
+			uint64_t behind = (g_ext_seq - start->ext_seq) - resident;
+			double pps = g_buffer_ms > 0
+			           ? (double)resident / ((double)g_buffer_ms / 1000.0) : 0.0;
+			rr.status = RESOLVE_TOO_OLD;
+			snprintf(rr.note, sizeof(rr.note),
+				"found at ext_seq %" PRIu64 ", live edge %" PRIu64 ", only the "
+				"newest %" PRIu64 " payloads resident: aged out of the %d ms "
+				"buffer about %.1f s ago",
+				start->ext_seq, g_ext_seq, resident, g_buffer_ms,
+				pps > 0.0 ? (double)behind / pps : 0.0);
+		}
+	}
+
 	if (rr.status != RESOLVE_OK)
 		g_requests_outside_buffer++;
 
@@ -760,48 +849,66 @@ static int stats_cb(void *arg, const struct rist_stats *sc)
 		g_queue_bytesize = v;
 
 	/*
-	 * Per-peer figures for the GUI. These are already in the stats JSON, so they
-	 * are lifted rather than recomputed -- the sender-side peer array is keyed by
-	 * "peer_id" with "quality", "rtt" and "retransmitted" alongside.
+	 * Per-peer figures for the GUI.
+	 *
+	 * The sender stats callback fires ONCE PER PEER and carries a single "peer"
+	 * object -- not an array -- so peers must be accumulated across callbacks
+	 * rather than read out of one document. The key is "id"; an earlier version
+	 * looked for "peer_id", which exists only in the C struct and never in the
+	 * JSON, so the list stayed empty while peers were plainly connected and
+	 * carrying a program selection.
+	 *
+	 * Entries expire: a peer that stops reporting has gone away, and a stale
+	 * row claiming a box is being served is worse than no row.
 	 */
-	pthread_mutex_lock(&peer_lock);
-	g_peer_count = 0;
-	const char *pp = strstr(sc->stats_json, "\"peers\"");
-	const char *cur = pp ? pp : sc->stats_json;
-	while (g_peer_count < MAX_TRACKED_PEERS) {
-		const char *idk = strstr(cur, "\"peer_id\":");
-		if (!idk)
-			break;
-		struct peer_stat *ps = &g_peers[g_peer_count];
-		memset(ps, 0, sizeof(*ps));
+	const char *p = strstr(sc->stats_json, "\"peer\"");
+	if (p) {
 		unsigned long long uv; double dv;
-		if (sscanf(idk + 10, "%llu", &uv) == 1)
-			ps->id = (uint32_t)uv;
-		/* Bound each lookup to this peer's object so a field missing here does
-		 * not silently pick up the next peer's value. */
-		const char *nxt = strstr(idk + 10, "\"peer_id\":");
-		size_t span = nxt ? (size_t)(nxt - idk) : strlen(idk);
-		char *obj = malloc(span + 1);
-		if (!obj)
-			break;
-		memcpy(obj, idk, span);
-		obj[span] = '\0';
-		const char *f;
-		if ((f = strstr(obj, "\"quality\":")) && sscanf(f + 10, "%lf", &dv) == 1)
-			ps->quality = dv;
-		if ((f = strstr(obj, "\"rtt\":")) && sscanf(f + 6, "%llu", &uv) == 1)
-			ps->rtt = uv;
-		if ((f = strstr(obj, "\"retransmitted\":")) && sscanf(f + 16, "%llu", &uv) == 1)
-			ps->retransmitted = uv;
-		if ((f = strstr(obj, "\"sent\":")) && sscanf(f + 7, "%llu", &uv) == 1)
-			ps->sent = uv;
-		free(obj);
-		g_peer_count++;
-		if (!nxt)
-			break;
-		cur = nxt;
+		uint32_t id = 0;
+		const char *k = strstr(p, "\"id\":");
+		if (k && sscanf(k + 5, "%llu", &uv) == 1)
+			id = (uint32_t)uv;
+
+		pthread_mutex_lock(&peer_lock);
+		struct peer_stat *ps = NULL;
+		for (int i = 0; i < g_peer_count; i++)
+			if (g_peers[i].id == id) { ps = &g_peers[i]; break; }
+		if (!ps && g_peer_count < MAX_TRACKED_PEERS)
+			ps = &g_peers[g_peer_count++];
+		if (ps) {
+			memset(ps, 0, sizeof(*ps));
+			ps->id = id;
+			ps->last_seen_us = now_us();
+			if ((k = strstr(p, "\"cname\":\"")))
+				sscanf(k + 9, "%63[^\"]", ps->cname);
+			if ((k = strstr(p, "\"type\":\"")))
+				sscanf(k + 8, "%7[^\"]", ps->type);
+			if ((k = strstr(p, "\"quality\":")) && sscanf(k + 10, "%lf", &dv) == 1)
+				ps->quality = dv;
+			if ((k = strstr(p, "\"sent\":")) && sscanf(k + 7, "%lf", &dv) == 1)
+				ps->sent = (uint64_t)dv;
+			if ((k = strstr(p, "\"received\":")) && sscanf(k + 11, "%lf", &dv) == 1)
+				ps->received = (uint64_t)dv;
+			if ((k = strstr(p, "\"retransmitted\":")) && sscanf(k + 16, "%lf", &dv) == 1)
+				ps->retransmitted = (uint64_t)dv;
+			if ((k = strstr(p, "\"bandwidth\":")) && sscanf(k + 12, "%lf", &dv) == 1)
+				ps->bandwidth = (uint64_t)dv;
+			/* rtt/avg_rtt are already divided by RIST_CLOCK, so milliseconds. */
+			if ((k = strstr(p, "\"avg_rtt\":")) && sscanf(k + 10, "%lf", &dv) == 1)
+				ps->avg_rtt_ms = dv;
+			if ((k = strstr(p, "\"rtt\":")) && sscanf(k + 6, "%lf", &dv) == 1)
+				ps->rtt_ms = dv;
+		}
+
+		/* Expire anything not heard from for 15 s -- the callback runs at 1 s. */
+		uint64_t cutoff = now_us() - 15000000ULL;
+		int w = 0;
+		for (int i = 0; i < g_peer_count; i++)
+			if (g_peers[i].last_seen_us >= cutoff)
+				g_peers[w++] = g_peers[i];
+		g_peer_count = w;
+		pthread_mutex_unlock(&peer_lock);
 	}
-	pthread_mutex_unlock(&peer_lock);
 
 	uint64_t threshold = SEQ_SPACE * TRIPWIRE_WARN_PCT / 100;
 	if (g_queue_size_max >= threshold && !g_tripwire_a_fired) {
@@ -1072,6 +1179,9 @@ static void emit_json(int fd)
 	double warn_s    = rtp_pps > 0.0
 		? (double)SEQ_SPACE * TRIPWIRE_WARN_PCT / 100.0 / rtp_pps : 0.0;
 
+	bool json_res_est = false;
+	uint64_t json_resident = resident_payloads(&json_res_est);
+
 	struct dbuf b = { 0 };
 	dbuf_add(&b, "{\"schema\":1,\"instance\":");
 	dbuf_json_str(&b, g_instance_name);
@@ -1097,10 +1207,14 @@ static void emit_json(int fd)
 	dbuf_add(&b, "\"buffer\":{\"payloads\":%" PRIu64 ",\"payloads_max\":%" PRIu64
 		",\"ms\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"pct_of_ceiling\":%.2f"
 		",\"have_stats\":%s,\"projected_payloads\":%.0f"
-		",\"safe_buffer_s\":%.1f,\"warn_buffer_s\":%.1f},",
+		",\"safe_buffer_s\":%.1f,\"warn_buffer_s\":%.1f"
+		",\"resident_payloads\":%" PRIu64 ",\"resident_measured\":%s"
+		",\"oldest_servable_ext\":%" PRIu64 "},",
 		g_queue_size_now, g_queue_size_max, g_queue_time_ms, g_queue_bytesize,
 		100.0 * (double)g_queue_size_now / (double)SEQ_SPACE,
-		g_have_queue_stats ? "true" : "false", projected, safe_s, warn_s);
+		g_have_queue_stats ? "true" : "false", projected, safe_s, warn_s,
+		json_resident, json_res_est ? "false" : "true",
+		g_ext_seq > json_resident ? g_ext_seq - json_resident : 0);
 
 	dbuf_add(&b, "\"tripwires\":{\"a\":%s,\"b\":%s,\"outside_buffer\":%" PRIu64 "},",
 		g_tripwire_a_fired ? "true" : "false",
@@ -1109,34 +1223,67 @@ static void emit_json(int fd)
 	/* Peers: count, quality and RTT come free from the stats callback. */
 	pthread_mutex_lock(&peer_lock);
 	dbuf_add(&b, "\"peers\":{\"count\":%d,\"list\":[", g_peer_count);
-	for (int i = 0; i < g_peer_count && i < MAX_TRACKED_PEERS; i++)
-		dbuf_add(&b, "%s{\"id\":%u,\"quality\":%.2f,\"rtt_ms\":%" PRIu64
-			",\"retransmitted\":%" PRIu64 ",\"sent\":%" PRIu64 "}",
-			i ? "," : "", g_peers[i].id, g_peers[i].quality, g_peers[i].rtt,
-			g_peers[i].retransmitted, g_peers[i].sent);
+	for (int i = 0; i < g_peer_count && i < MAX_TRACKED_PEERS; i++) {
+		dbuf_add(&b, "%s{\"id\":%u,\"cname\":", i ? "," : "", g_peers[i].id);
+		dbuf_json_str(&b, g_peers[i].cname);
+		dbuf_add(&b, ",\"type\":");
+		dbuf_json_str(&b, g_peers[i].type);
+		dbuf_add(&b, ",\"quality\":%.2f,\"rtt_ms\":%.2f,\"avg_rtt_ms\":%.2f"
+			",\"retransmitted\":%" PRIu64 ",\"sent\":%" PRIu64
+			",\"received\":%" PRIu64 ",\"bandwidth_bps\":%" PRIu64
+			",\"last_seen_s\":%.1f}",
+			g_peers[i].quality, g_peers[i].rtt_ms, g_peers[i].avg_rtt_ms,
+			g_peers[i].retransmitted, g_peers[i].sent, g_peers[i].received,
+			g_peers[i].bandwidth,
+			(double)(now - g_peers[i].last_seen_us) / 1e6);
+	}
 	dbuf_add(&b, "]},");
 	pthread_mutex_unlock(&peer_lock);
 
 	/* (2) catalogue health -- Part 8 specific, exists nowhere else. */
+	/*
+	 * Occupancy is not the interesting number. The ring deliberately holds far
+	 * more PCR history than the retransmission buffer can serve -- 2048 entries
+	 * is 39-81 s against a 4 s buffer -- so once it saturates, "entries" reads
+	 * 100% forever and would read the same if ingest had stopped. What moves,
+	 * and what an operator actually needs, is how much of that history is still
+	 * SERVABLE, and how far back the history reaches.
+	 *
+	 * Counted by walking back from the newest entry until it falls out of the
+	 * servable window, so the cost is the servable span (~4 s) rather than the
+	 * whole ring, and the catalogue lock is held only briefly.
+	 */
+	uint64_t oldest_ok = g_ext_seq > json_resident ? g_ext_seq - json_resident : 0;
 	pthread_mutex_lock(&catalogue_lock);
-	size_t npids = 0, entries = 0, capacity = 0;
+	size_t npids = 0, entries = 0, capacity = 0, servable = 0;
+	int64_t history_max_ticks = 0;
 	dbuf_add(&b, "\"catalogue\":{\"pids\":[");
 	for (int pid = 0; pid < MAX_PIDS; pid++) {
 		struct pcr_ring *r = rings[pid];
 		if (!r || r->count == 0) continue;
-		dbuf_add(&b, "%s{\"pid\":%d,\"depth\":%zu,\"cap\":%zu,\"total\":%" PRIu64
-			",\"epoch\":%" PRIu32 "}", npids ? "," : "",
-			pid, r->count, r->cap, r->total_entries, r->epoch);
+
+		size_t sv = 0;
+		for (size_t i = r->count; i-- > 0; ) {
+			if (ring_at(r, i)->ext_seq < oldest_ok) break;
+			sv++;
+		}
+		int64_t span = pcr_diff(ring_at(r, r->count - 1)->pcr_base,
+		                        ring_at(r, 0)->pcr_base);
+		if (span > history_max_ticks) history_max_ticks = span;
+
+		dbuf_add(&b, "%s{\"pid\":%d,\"depth\":%zu,\"cap\":%zu,\"servable\":%zu"
+			",\"history_ms\":%.0f,\"total\":%" PRIu64 ",\"epoch\":%" PRIu32 "}",
+			npids ? "," : "", pid, r->count, r->cap, sv,
+			(double)span * 1000.0 / (double)PCR_HZ, r->total_entries, r->epoch);
 		npids++;
 		entries  += r->count;
 		capacity += r->cap;
+		servable += sv;
 	}
-	/* entries is OCCUPANCY, capacity is the ceiling it is measured against.
-	 * Reporting occupancy alone was misleading: with every ring at cap it reads
-	 * as a large constant that would look identical if the catalogue were
-	 * stalled. */
-	dbuf_add(&b, "],\"pid_count\":%zu,\"entries\":%zu,\"capacity\":%zu},",
-		npids, entries, capacity);
+	dbuf_add(&b, "],\"pid_count\":%zu,\"entries\":%zu,\"capacity\":%zu"
+		",\"servable\":%zu,\"history_ms\":%.0f},",
+		npids, entries, capacity, servable,
+		(double)history_max_ticks * 1000.0 / (double)PCR_HZ);
 	pthread_mutex_unlock(&catalogue_lock);
 
 	/* (3) discontinuity events. Section 7 is still open and a real field
