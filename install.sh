@@ -464,7 +464,11 @@ server {
         fastcgi_read_timeout 60;
     }
 
-    location /assets/ { expires 1h; add_header Cache-Control "public"; }
+    # No caching for the app's own assets. They are a few KB, and an operations
+    # tool that keeps showing a stale panel after a deploy costs far more than
+    # the bytes save. index.php also mtime-stamps the URLs, which is what makes
+    # an already-cached copy get replaced.
+    location /assets/ { add_header Cache-Control "no-cache, must-revalidate"; }
     location ~ ^/config/ { deny all; }
     location ~ /\.      { deny all; }
 

@@ -86,6 +86,14 @@ That **~2.1 Mb/s floor is the cost of a box being in fallback**, not the cost of
 ordinary repair. **Targeted STC-NACK repairs are bounded ranges and do not carry
 it.** Do not budget WAN capacity as though every box paid it continuously.
 
+Measured on the live headend: **4.07 Mb/s for BET**, against 5.22 Mb/s predicted
+from the capture. The floor is real but the bench figure overstated it; use the
+measured number. Note this was taken with **FSR ENGAGED** -- the bench receiver's
+dead weight-0 peer makes it declare its satellite path failed, which is the only
+way live data passes the FSR gate. So 4.07 Mb/s is the **full-stream fallback**
+cost of one box, not the cost of ordinary repair, and capacity planning must keep
+those two apart.
+
 ---
 
 ## 5. Resolution API: only `RESOLVE_OK` means "serve this"
@@ -93,9 +101,27 @@ it.** Do not budget WAN capacity as though every box paid it continuously.
 `resolve()` returns an `enum resolve_status`, not a bool, and `RESOLVE_OK` is
 deliberately non-zero so a zeroed struct can never look serviceable. Test
 `resolve_serviceable()`. A nearest-PCR search on a non-empty ring *always* finds
-something, so a populated `start_ext` is not evidence that the range may be sent;
-`BEFORE_EPOCH` and `OUTSIDE_BUFFER` both come back with diagnostic fields filled
-in and must not be served.
+something, so a populated `start_ext` is not evidence that the range may be sent.
+
+Four non-OK statuses, and the distinction between the last two matters:
+
+| status | meaning |
+|---|---|
+| `NO_CATALOGUE` | nothing has ever been catalogued for this PID |
+| `BEFORE_EPOCH` | the request predates the epoch it resolved into |
+| `OUTSIDE_BUFFER` | the nearest PCR held is further from the request than the buffer could span — the request is nowhere near anything we have |
+| `TOO_OLD` | **we have exactly what was asked for, and it has aged out of the retransmission buffer** |
+
+`TOO_OLD` is the one the oversized ring exists to produce. It is checked against
+the **live edge** using payload residency, not against the nearest PCR and not
+against the clock: librist holds the newest N payloads, so anything older than
+(live edge − N) is gone regardless of what the timestamps say.
+
+That check was missing at first, and its absence was the most serious defect
+found on hardware: an **exact** hit on a 40-second-old entry gave a distance of
+zero, passed every check, and returned `RESOLVE_OK` with a sequence librist had
+dropped long before. Milestone 2 must treat `TOO_OLD` as "your request was late",
+distinct from `NO_CATALOGUE`'s "you asked about something we never had".
 
 ---
 
@@ -117,10 +143,39 @@ nominal + 2×min_rtt sizing (`min_rtt = buffer / max_retries` = 200 ms).
 
 ---
 
-## 7. Still owed before Milestone 2 closes
+## 7. CLOSED — the epoch logic has now run against real data
 
-The capture used so far contains **zero** packets with `discontinuity_indicator`
-set. The epoch handling in `catalogue_insert()` and the nearest-across-all-epochs
-search in `resolve()` are therefore validated **only synthetically** (A5, R3) and
-have never met a real discontinuity. A longer capture containing one is
-outstanding.
+A genuine discontinuity occurred on the live headend and the corrected epoch
+semantics handled it:
+
+```
+0x03E8 backward-jump delta=-27,044,504 ticks (-300.5 s) -> epoch 1
+0x03E8 forward-jump  delta=+27,045,604 ticks (+300.5 s)  99 payloads later
+```
+
+A real backward jump created epoch 1, which is what the nearest-across-all-epochs
+search was written for and what had previously only been exercised synthetically
+(A5, R3). **This item is closed.**
+
+It is the same PID as the continuity-counter anomaly found in C4/C5: two PCR
+timelines interleaved on one PID, matching the two independent continuity
+counters the greedy-assignment analysis found. **One upstream defect, two
+symptoms** — worth raising with whoever operates that encoder.
+
+### Operational note: never point a second consumer at a running input port
+
+A `tsp -I ip 0.0.0.0:5800` against a live instance's input port makes two
+consumers compete for one UDP socket. The kernel gives datagrams to whichever
+reads first, starving the server for as long as the second consumer runs. The
+detector reports this correctly and unmistakably -- 32 simultaneous forward jumps
+of ~10 s, one per catalogued PID -- but the feed really is interrupted. To
+inspect a live input, tee it upstream instead.
+
+## 8. Idle services move the PID count
+
+Two services on this transponder currently carry no packets at all (0x0021 and
+Vacation's 0x0673), so their PCR PIDs are absent from the catalogue. The
+catalogue PID count is therefore a **live-content indicator**, not a health
+signal: it moves for reasons that have nothing to do with Part 8. Do not alarm
+on a change in it. A count of zero, or zero servable entries, is worth a warning;
+a count that drops from 33 to 32 is a service going idle upstream.

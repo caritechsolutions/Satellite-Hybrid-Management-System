@@ -94,10 +94,41 @@ Against a real 59.145 Mb/s / 35-service transponder capture:
 - **A 4 s buffer holds ~24,900 payloads = 38% of the 65,536 sequence space**, with
   the first tripwire at ~7.9 s and the ceiling at ~10.5 s.
 
-## Known gap in coverage
+## Do not point a second consumer at a running instance's input port
 
-The capture used so far contains **zero** packets with `discontinuity_indicator`
-set, so the epoch/discontinuity logic in `catalogue_insert()` and `resolve()` is
-exercised only by the synthetic tests (A5, R3) and **has never been validated
-against real data**. A longer capture containing a real discontinuity is still
-owed before Milestone 2 closes.
+```
+tsp -I ip 0.0.0.0:5800 ...        # NOT against a live instance
+```
+
+Two consumers on one UDP port compete, and the kernel hands each datagram to
+only one of them. Doing this to a live instance starves the server for as long
+as the second consumer runs. It is detected and reported accurately -- 32
+simultaneous forward jumps of ~10 s, one per catalogued PID -- but the feed is
+genuinely interrupted while it happens. Tee the stream upstream instead.
+
+## Reading the catalogue's extent
+
+`bounds [pid]` reports, per PID, the oldest and newest PCR held, which of them
+are still servable, and the spans in ms. Any base between `oldest` and
+`oldest_servable` must resolve `TOO_OLD`: still in the ring, past the buffer.
+
+```
+$ printf 'bounds 0x0731\n' | nc -U /run/part8-recovery/<instance>/debug.sock
+live_ext_seq=22472 resident=6220 oldest_servable_ext=16252
+pid 0x0731 count=101 servable=28 oldest=1868451840 newest=1868808345
+    oldest_servable=1868712047 history_ms=3961 servable_ms=1070 epoch=0 epochs=1
+```
+
+Spans are measured **within the newest epoch only** -- a PCR difference across a
+discontinuity is meaningless because the clock restarted -- and `epochs=` says
+whether the ring currently spans more than one.
+
+`resolve` accepts either `0x0731` or `1841`.
+
+## Coverage note
+
+The epoch/discontinuity logic was validated against real data on the live
+headend: PID 0x03E8 produced a genuine backward jump of -300.5 s which created
+epoch 1, and a matching forward jump 99 payloads later. It is the same PID as the
+continuity-counter anomaly from C4/C5 -- two interleaved PCR timelines on one
+PID, one upstream defect with two symptoms.

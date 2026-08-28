@@ -1042,6 +1042,7 @@ static void log_periodic(void)
  * Local only -- a unix socket, never a wildcard-bound port. Line protocol:
  *   resolve <pid> <pcr_base> <duration_ticks>
  *   stats
+ *   bounds [pid]
  *   events
  */
 static char g_debug_path[108] = DEFAULT_DEBUG_SOCK;   /* sun_path is 108 */
@@ -1272,9 +1273,12 @@ static void emit_json(int fd)
 		if (span > history_max_ticks) history_max_ticks = span;
 
 		dbuf_add(&b, "%s{\"pid\":%d,\"depth\":%zu,\"cap\":%zu,\"servable\":%zu"
-			",\"history_ms\":%.0f,\"total\":%" PRIu64 ",\"epoch\":%" PRIu32 "}",
+			",\"history_ms\":%.0f,\"oldest\":%" PRIu64 ",\"newest\":%" PRIu64
+			",\"total\":%" PRIu64 ",\"epoch\":%" PRIu32 "}",
 			npids ? "," : "", pid, r->count, r->cap, sv,
-			(double)span * 1000.0 / (double)PCR_HZ, r->total_entries, r->epoch);
+			(double)span * 1000.0 / (double)PCR_HZ,
+			ring_at(r, 0)->pcr_base, ring_at(r, r->count - 1)->pcr_base,
+			r->total_entries, r->epoch);
 		npids++;
 		entries  += r->count;
 		capacity += r->cap;
@@ -1312,12 +1316,31 @@ static void emit_json(int fd)
 	dbuf_flush(&b, fd);
 }
 
+/* Accept 0x0731 as well as 1841. Everything else in the tooling -- the logs,
+ * TSDuck, the PMT -- speaks hex, so requiring decimal here invites mistakes.
+ * Base is chosen explicitly rather than using strtoul(.., 0), which would read
+ * a leading-zero PID like 0021 as OCTAL. */
+static bool parse_pid_token(const char *tok, unsigned *out)
+{
+	char *end = NULL;
+	int base = (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) ? 16 : 10;
+	unsigned long v = strtoul(tok, &end, base);
+	if (end == tok || (end && *end && *end != '\n' && *end != '\r'))
+		return false;
+	if (v > 8191)
+		return false;
+	*out = (unsigned)v;
+	return true;
+}
+
 static void debug_handle(int fd, const char *line)
 {
 	char out[1024];
 	unsigned pid; unsigned long long base, dur;
+	char pidtok[32];
 
-	if (sscanf(line, "resolve %u %llu %llu", &pid, &base, &dur) == 3) {
+	if (sscanf(line, "resolve %31s %llu %llu", pidtok, &base, &dur) == 3
+	    && parse_pid_token(pidtok, &pid)) {
 		struct resolve_result rr = resolve((uint16_t)pid, base & PCR_MASK33, dur);
 		if (!resolve_serviceable(&rr)) {
 			/*
@@ -1387,6 +1410,72 @@ static void debug_handle(int fd, const char *line)
 	} else if (strncmp(line, "json", 4) == 0) {
 		emit_json(fd);
 		return;
+	} else if (strncmp(line, "bounds", 6) == 0) {
+		/*
+		 * The catalogue's current extent, per PID.
+		 *
+		 * Added because TOO_OLD was untestable without it: exercising it needs a
+		 * PCR that is still IN the ring but PAST the buffer, and there was no way
+		 * to learn a current PCR from this socket at all -- `events` only reports
+		 * discontinuities and `stats` only depths. The only route left was to
+		 * induce a discontinuity, which is absurd for a routine check. It is also
+		 * the obvious thing to want when a request has just been refused.
+		 *
+		 * Any base between `oldest` and `oldest_servable` must resolve TOO_OLD.
+		 */
+		char btok[32]; unsigned only_pid = 0; bool one = false;
+		if (sscanf(line, "bounds %31s", btok) == 1 && parse_pid_token(btok, &only_pid))
+			one = true;
+
+		bool est = false;
+		uint64_t resident = resident_payloads(&est);
+		struct dbuf b = {0};
+		pthread_mutex_lock(&catalogue_lock);
+		uint64_t oldest_ok = g_ext_seq > resident ? g_ext_seq - resident : 0;
+		dbuf_add(&b, "live_ext_seq=%" PRIu64 " resident=%" PRIu64 "%s"
+			" oldest_servable_ext=%" PRIu64 "\n",
+			g_ext_seq, resident, est ? "(est)" : "", oldest_ok);
+		for (int pid = 0; pid < MAX_PIDS; pid++) {
+			struct pcr_ring *r = rings[pid];
+			if (!r || r->count == 0) continue;
+			if (one && (unsigned)pid != only_pid) continue;
+			struct pcr_entry *o = ring_at(r, 0);
+			struct pcr_entry *n = ring_at(r, r->count - 1);
+			/*
+			 * Spans are measured WITHIN THE NEWEST EPOCH only. A PCR difference
+			 * across a discontinuity is meaningless -- the clock restarted -- so
+			 * subtracting the ring's oldest base from its newest would report a
+			 * span that never elapsed. epochs= says whether that matters here.
+			 */
+			uint32_t ep = n->epoch, nep = 1;
+			uint64_t osb = n->pcr_base, oldest_ep = n->pcr_base;
+			size_t sv = 0;
+			bool still_servable = true;
+			for (size_t i = r->count; i-- > 0; ) {
+				struct pcr_entry *e = ring_at(r, i);
+				if (e->epoch != ep) { nep++; ep = e->epoch; continue; }
+				if (e->epoch == n->epoch) {
+					oldest_ep = e->pcr_base;
+					if (still_servable && e->ext_seq >= oldest_ok) {
+						osb = e->pcr_base;
+						sv++;
+					} else {
+						still_servable = false;
+					}
+				}
+			}
+			dbuf_add(&b,
+				"pid 0x%04X count=%zu servable=%zu oldest=%" PRIu64
+				" newest=%" PRIu64 " oldest_servable=%" PRIu64
+				" history_ms=%.0f servable_ms=%.0f epoch=%" PRIu32 " epochs=%u\n",
+				pid, r->count, sv, o->pcr_base, n->pcr_base, osb,
+				(double)pcr_diff(n->pcr_base, oldest_ep) * 1000.0 / (double)PCR_HZ,
+				(double)pcr_diff(n->pcr_base, osb) * 1000.0 / (double)PCR_HZ,
+				n->epoch, nep);
+		}
+		pthread_mutex_unlock(&catalogue_lock);
+		dbuf_flush(&b, fd);
+		return;
 	} else if (strncmp(line, "events", 6) == 0) {
 		/*
 		 * The discontinuity ring (O3). Reported after the fact on purpose: the
@@ -1414,7 +1503,8 @@ static void debug_handle(int fd, const char *line)
 		return;
 	} else {
 		snprintf(out, sizeof(out),
-			"ERR usage: 'resolve <pid> <pcr_base> <duration_ticks>' | 'stats' | 'events' | 'json'\n");
+			"ERR usage: 'resolve <pid|0xPID> <pcr_base> <duration_ticks>' | 'stats' |\n"
+			"    'bounds [pid]' | 'events' | 'json'\n");
 	}
 	dbuf_write_all(fd, out, strlen(out));
 }

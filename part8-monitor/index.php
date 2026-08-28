@@ -1,11 +1,26 @@
-<?php require __DIR__ . '/lib.php'; ?>
+<?php
+require __DIR__ . '/lib.php';
+/*
+ * Asset URLs carry the file mtime.
+ *
+ * Without this a deployed fix can sit on disk, correct, while the browser keeps
+ * serving an hour-old cached copy -- which is exactly what happened: a panel fix
+ * landed and the old rendering kept appearing, costing a round trip to work out
+ * that the code was right and the cache was stale. An ops tool must show what is
+ * actually deployed.
+ */
+$P8_V = static function (string $f): string {
+    $p = __DIR__ . '/' . $f;
+    return $f . '?v=' . (is_file($p) ? (string)filemtime($p) : '0');
+};
+?>
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Part 8 Recovery Servers</title>
-<link rel="stylesheet" href="assets/app.css">
+<link rel="stylesheet" href="<?= $P8_V('assets/app.css') ?>">
 </head>
 <body>
 
@@ -113,6 +128,6 @@
   </form>
 </div>
 
-<script src="assets/app.js"></script>
+<script src="<?= $P8_V('assets/app.js') ?>"></script>
 </body>
 </html>
