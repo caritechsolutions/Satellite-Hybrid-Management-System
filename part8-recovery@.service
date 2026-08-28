@@ -29,6 +29,7 @@ ExecStart=/bin/sh -c 'exec /usr/local/bin/part8_recovery_server \
     -r "$P8_RCVBUF" \
     -N "%i" \
     -d /run/part8-recovery/%i/debug.sock \
+    -g "${P8_SOCK_GROUP:-www-data}" \
     $P8_EXTRA'
 
 # D1 (blocking accept in the debug thread) is fixed, so SIGTERM is honoured and

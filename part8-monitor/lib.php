@@ -23,6 +23,11 @@ const P8_PORT_MAX   = 9899;
 const P8_DEFAULT_BUFFER_MS = 4000;
 const P8_DEFAULT_RCVBUF    = 33554432;
 
+/* The group the debug socket is handed to. This must be a group the web user is
+ * in; it is the web user's own primary group by default, which is what nginx
+ * and php-fpm run as. */
+const P8_SOCK_GROUP        = 'www-data';
+
 function p8_instances(): array
 {
     if (!is_file(P8_STORE)) return [];
@@ -286,7 +291,11 @@ function p8_env_body(array $inst): string
                                    $inst['listen_port'], $inst['buffer_ms']) . "\"\n" .
         'P8_BUFFER_MS='  . (int)$inst['buffer_ms'] . "\n" .
         'P8_RCVBUF='     . (int)$inst['rcvbuf'] . "\n" .
-        'P8_EXTRA="'     . (empty($inst['require_selection']) ? '-S' : '') . "\"\n";
+        'P8_EXTRA="'     . (empty($inst['require_selection']) ? '-S' : '') . "\"\n" .
+        // Connecting to a unix socket needs WRITE permission on it. The server
+        // runs as root, so without this the UI gets EACCES and every panel reads
+        // as if the instance were down.
+        'P8_SOCK_GROUP="' . (P8_SOCK_GROUP) . "\"\n";
 }
 
 /* ------------------------------------------------------------- live stats */

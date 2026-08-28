@@ -132,8 +132,13 @@ function render(rows) {
 
   $$('.card', host).forEach(c => { if (!seen.has(c.dataset.name)) c.remove(); });
 
-  if (!rows.length && !$('.empty', host))
+  // Only when there really are none. This used to print above an existing card,
+  // which read as a contradiction.
+  const emptyMsg = $('.empty', host);
+  if (!rows.length && !emptyMsg)
     host.innerHTML = '<p class="empty">No instances yet. "Add instance" creates one per transponder.</p>';
+  else if (rows.length && emptyMsg)
+    emptyMsg.remove();
 
   const bits = [`${rows.length} instance${rows.length === 1 ? '' : 's'}`, `${active} running`];
   if (tripped) bits.push(`${tripped} TRIPWIRE`);
@@ -179,8 +184,14 @@ function renderMetrics(card, row, s) {
     p.count ? `mean quality ${q.toFixed(1)}%` : 'none attached',
     p.count ? (q < 95 ? 'warn' : 'ok') : '');
 
-  setMetric(card, 'cat', String(s.catalogue.pid_count),
-    `${s.catalogue.entries} entries`, s.catalogue.pid_count ? '' : 'warn');
+  // Occupancy AGAINST capacity. Occupancy alone reads as a large constant once
+  // every ring is at cap, and would look identical if the catalogue had stalled.
+  const cat = s.catalogue;
+  const capPct = cat.capacity ? (100 * cat.entries / cat.capacity) : 0;
+  setMetric(card, 'cat', `${cat.pid_count} PIDs`,
+    `${cat.entries.toLocaleString()} / ${(cat.capacity || 0).toLocaleString()} entries` +
+    (cat.capacity ? ` (${capPct.toFixed(0)}% of ring capacity)` : ''),
+    cat.pid_count ? '' : 'warn');
 
   const t = s.tripwires;
   setMetric(card, 'trip', (t.a || t.b) ? [t.a && 'A', t.b && 'B'].filter(Boolean).join('+') : 'clear',

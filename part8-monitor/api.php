@@ -88,8 +88,6 @@ case 'list':
     }
     out(['ok' => true, 'instances' => $rows, 'now' => time()]);
 
-case 'boom':
-    p8_boom();
 case 'suggest_port':
     [$p, $err] = p8_alloc_port();
     out($p ? ['ok' => true, 'port' => $p] : ['ok' => false, 'error' => $err]);

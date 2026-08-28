@@ -58,6 +58,8 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
+#include <grp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <librist/librist.h>
@@ -893,18 +895,38 @@ static void log_periodic(void)
 			                   / rate_bps * 1000.0 : 0.0);
 	}
 
+	/*
+	 * Same predicate as the JSON stats: a PID counts if it holds entries.
+	 *
+	 * These used to differ -- the log skipped iv_n == 0 to avoid dividing by
+	 * zero for the mean interval, the JSON skipped count == 0 -- so the two
+	 * could report different PID counts for the same catalogue, and did. The
+	 * division is guarded instead, and a summary line is emitted that can be
+	 * compared directly against the panel rather than by counting log lines.
+	 */
 	pthread_mutex_lock(&catalogue_lock);
+	size_t npids = 0;
+	uint64_t entries = 0, capacity = 0;
 	for (int pid = 0; pid < MAX_PIDS; pid++) {
 		struct pcr_ring *r = rings[pid];
-		if (!r || r->iv_n == 0)
+		if (!r || r->count == 0)
 			continue;
+		npids++;
+		entries  += r->count;
+		capacity += r->cap;
 		rist_log(&logging_settings, RIST_LOG_INFO,
 			"[CATALOGUE] pid 0x%04X depth=%zu/%zu total=%" PRIu64
 			" epoch=%" PRIu32 " (%u changes) interval us min=%" PRIu64
 			" max=%" PRIu64 " mean=%" PRIu64 "\n",
 			pid, r->count, r->cap, r->total_entries, r->epoch, r->epoch_changes,
-			r->iv_min, r->iv_max, r->iv_sum / r->iv_n);
+			r->iv_n ? r->iv_min : 0, r->iv_n ? r->iv_max : 0,
+			r->iv_n ? r->iv_sum / r->iv_n : 0);
 	}
+	rist_log(&logging_settings, RIST_LOG_INFO,
+		"[CATALOGUE] %zu PIDs, %" PRIu64 " entries resident of %" PRIu64
+		" ring capacity (%.0f%%)\n",
+		npids, entries, capacity,
+		capacity ? 100.0 * (double)entries / (double)capacity : 0.0);
 	pthread_mutex_unlock(&catalogue_lock);
 }
 
@@ -916,6 +938,18 @@ static void log_periodic(void)
  *   events
  */
 static char g_debug_path[108] = DEFAULT_DEBUG_SOCK;   /* sun_path is 108 */
+
+/*
+ * Group allowed to reach the debug socket.
+ *
+ * CONNECTING to a unix socket requires WRITE permission on it, not read. The
+ * server runs as root and the socket lands 0755 root:root, so a web UI running
+ * as www-data gets EACCES on connect -- which looks exactly like "the instance
+ * is down". It never showed in testing because the socket was only ever read as
+ * root. World-writable would fix it and is not acceptable, so the socket is
+ * chowned to this group and set 0660: reachable by the UI, nobody else.
+ */
+static char g_sock_group[64] = "";
 
 /*
  * A growable response buffer.
@@ -1085,18 +1119,24 @@ static void emit_json(int fd)
 
 	/* (2) catalogue health -- Part 8 specific, exists nowhere else. */
 	pthread_mutex_lock(&catalogue_lock);
-	size_t npids = 0, entries = 0;
+	size_t npids = 0, entries = 0, capacity = 0;
 	dbuf_add(&b, "\"catalogue\":{\"pids\":[");
 	for (int pid = 0; pid < MAX_PIDS; pid++) {
 		struct pcr_ring *r = rings[pid];
 		if (!r || r->count == 0) continue;
-		dbuf_add(&b, "%s{\"pid\":%d,\"depth\":%zu,\"total\":%" PRIu64
+		dbuf_add(&b, "%s{\"pid\":%d,\"depth\":%zu,\"cap\":%zu,\"total\":%" PRIu64
 			",\"epoch\":%" PRIu32 "}", npids ? "," : "",
-			pid, r->count, r->total_entries, r->epoch);
+			pid, r->count, r->cap, r->total_entries, r->epoch);
 		npids++;
-		entries += r->count;
+		entries  += r->count;
+		capacity += r->cap;
 	}
-	dbuf_add(&b, "],\"pid_count\":%zu,\"entries\":%zu},", npids, entries);
+	/* entries is OCCUPANCY, capacity is the ceiling it is measured against.
+	 * Reporting occupancy alone was misleading: with every ring at cap it reads
+	 * as a large constant that would look identical if the catalogue were
+	 * stalled. */
+	dbuf_add(&b, "],\"pid_count\":%zu,\"entries\":%zu,\"capacity\":%zu},",
+		npids, entries, capacity);
 	pthread_mutex_unlock(&catalogue_lock);
 
 	/* (3) discontinuity events. Section 7 is still open and a real field
@@ -1251,6 +1291,31 @@ static void *debug_thread(void *arg)
 		close(srv);
 		return NULL;
 	}
+	/*
+	 * Permissions AFTER bind: the socket does not exist until bind() creates it,
+	 * and umask would otherwise decide who can reach it.
+	 */
+	if (g_sock_group[0]) {
+		struct group *gr = getgrnam(g_sock_group);
+		if (!gr) {
+			rist_log(&logging_settings, RIST_LOG_WARN,
+				"debug socket group '%s' does not exist; leaving default "
+				"permissions -- a UI running as another user will get EACCES\n",
+				g_sock_group);
+		} else if (chown(g_debug_path, (uid_t)-1, gr->gr_gid) != 0) {
+			rist_log(&logging_settings, RIST_LOG_WARN,
+				"could not chown debug socket to group %s: %s\n",
+				g_sock_group, strerror(errno));
+		} else if (chmod(g_debug_path, 0660) != 0) {
+			rist_log(&logging_settings, RIST_LOG_WARN,
+				"could not chmod debug socket to 0660: %s\n", strerror(errno));
+		} else {
+			rist_log(&logging_settings, RIST_LOG_INFO,
+				"[DEBUG] socket group=%s mode=0660 (connect needs write; "
+				"NOT world-writable)\n", g_sock_group);
+		}
+	}
+
 	listen(srv, 4);
 	rist_log(&logging_settings, RIST_LOG_INFO,
 		"[DEBUG] listening on unix:%s  (echo 'resolve <pid> <base> <dur>' | nc -U %s)\n",
@@ -1433,6 +1498,8 @@ static void usage(const char *me)
 		"  -r BYTES     SO_RCVBUF request, default %d\n"
 		"  -d PATH      debug unix socket, default %s\n"
 		"  -N NAME      instance name, reported in stats and logs\n"
+		"  -g GROUP     chown the debug socket to GROUP and set 0660, so a UI\n"
+		"               running as that group can connect (connect needs write)\n"
 		"  -S           do NOT require a registered content selection (unsafe)\n"
 		"  -v           verbose\n", me, DEFAULT_BUFFER_MS, DEFAULT_RCVBUF, DEFAULT_DEBUG_SOCK);
 }
@@ -1445,7 +1512,7 @@ int main(int argc, char *argv[])
 	bool saw_npd = false;
 	int c;
 
-	while ((c = getopt(argc, argv, "i:o:b:r:d:N:Snvh")) != -1) {
+	while ((c = getopt(argc, argv, "i:o:b:r:d:N:g:Snvh")) != -1) {
 		switch (c) {
 		case 'i': inurl  = strdup(optarg); break;
 		case 'o': outurl = strdup(optarg); break;
@@ -1453,6 +1520,7 @@ int main(int argc, char *argv[])
 		case 'r': rcvbuf = atoi(optarg); break;
 		case 'd': snprintf(g_debug_path, sizeof(g_debug_path), "%s", optarg); break;
 		case 'N': snprintf(g_instance_name, sizeof(g_instance_name), "%s", optarg); break;
+		case 'g': snprintf(g_sock_group, sizeof(g_sock_group), "%s", optarg); break;
 		case 'S': require_selection = false; break;
 		case 'n': saw_npd = true; break;
 		case 'v': logging_settings.log_level = RIST_LOG_DEBUG; break;
