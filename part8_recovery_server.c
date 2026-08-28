@@ -1432,7 +1432,9 @@ static void debug_handle(int fd, const char *line)
 		struct dbuf b = {0};
 		pthread_mutex_lock(&catalogue_lock);
 		uint64_t oldest_ok = g_ext_seq > resident ? g_ext_seq - resident : 0;
-		dbuf_add(&b, "live_ext_seq=%" PRIu64 " resident=%" PRIu64 "%s"
+		dbuf_add(&b, "# oldest/oldest_servable drift at wall-clock rate on a full "
+			"ring; use too_old_probe for TOO_OLD and newest for OK\n"
+			"live_ext_seq=%" PRIu64 " resident=%" PRIu64 "%s"
 			" oldest_servable_ext=%" PRIu64 "\n",
 			g_ext_seq, resident, est ? "(est)" : "", oldest_ok);
 		for (int pid = 0; pid < MAX_PIDS; pid++) {
@@ -1464,11 +1466,33 @@ static void debug_handle(int fd, const char *line)
 					}
 				}
 			}
+			/*
+			 * A STABLE probe for the TOO_OLD path.
+			 *
+			 * `oldest` is the eviction frontier: on a full ring it advances at
+			 * wall-clock rate, so it is stale the moment it is read. Measured --
+			 * resolving it after a delay of 50/200/1000/3000 ms drifts by
+			 * 45/207/988/3012 ms, i.e. exactly the delay. It only resolves
+			 * TOO_OLD if the resolve lands within one PCR interval of the bounds
+			 * call, which is unreachable by hand.
+			 *
+			 * So report a real entry midway between the oldest and the first
+			 * still-servable one: comfortably inside the ring, comfortably past
+			 * the buffer, and with tens of seconds of margin against the same
+			 * drift. That is the value to feed back to `resolve` to exercise
+			 * TOO_OLD. `newest` is the stable POSITIVE case for the same reason.
+			 */
+			uint64_t probe = 0;
+			size_t first_sv = r->count > sv ? r->count - sv : 0;
+			if (first_sv > 1)
+				probe = ring_at(r, first_sv / 2)->pcr_base;
+
 			dbuf_add(&b,
 				"pid 0x%04X count=%zu servable=%zu oldest=%" PRIu64
 				" newest=%" PRIu64 " oldest_servable=%" PRIu64
+				" too_old_probe=%" PRIu64
 				" history_ms=%.0f servable_ms=%.0f epoch=%" PRIu32 " epochs=%u\n",
-				pid, r->count, sv, o->pcr_base, n->pcr_base, osb,
+				pid, r->count, sv, o->pcr_base, n->pcr_base, osb, probe,
 				(double)pcr_diff(n->pcr_base, oldest_ep) * 1000.0 / (double)PCR_HZ,
 				(double)pcr_diff(n->pcr_base, osb) * 1000.0 / (double)PCR_HZ,
 				n->epoch, nep);

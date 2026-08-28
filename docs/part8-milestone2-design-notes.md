@@ -112,6 +112,10 @@ Four non-OK statuses, and the distinction between the last two matters:
 | `OUTSIDE_BUFFER` | the nearest PCR held is further from the request than the buffer could span — the request is nowhere near anything we have |
 | `TOO_OLD` | **we have exactly what was asked for, and it has aged out of the retransmission buffer** |
 
+To exercise `TOO_OLD` from the debug socket, use the `too_old_probe` value from
+`bounds` -- not `oldest`, which is the eviction frontier and drifts at wall-clock
+rate on a full ring.
+
 `TOO_OLD` is the one the oversized ring exists to produce. It is checked against
 the **live edge** using payload residency, not against the nearest PCR and not
 against the clock: librist holds the newest N payloads, so anything older than

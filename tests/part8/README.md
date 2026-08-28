@@ -106,24 +106,56 @@ as the second consumer runs. It is detected and reported accurately -- 32
 simultaneous forward jumps of ~10 s, one per catalogued PID -- but the feed is
 genuinely interrupted while it happens. Tee the stream upstream instead.
 
-## Reading the catalogue's extent
+## Reading the catalogue's extent, and testing the refusal paths
 
 `bounds [pid]` reports, per PID, the oldest and newest PCR held, which of them
-are still servable, and the spans in ms. Any base between `oldest` and
-`oldest_servable` must resolve `TOO_OLD`: still in the ring, past the buffer.
+are still servable, and the spans.
 
 ```
-$ printf 'bounds 0x0731\n' | nc -U /run/part8-recovery/<instance>/debug.sock
-live_ext_seq=22472 resident=6220 oldest_servable_ext=16252
-pid 0x0731 count=101 servable=28 oldest=1868451840 newest=1868808345
-    oldest_servable=1868712047 history_ms=3961 servable_ms=1070 epoch=0 epochs=1
+$ printf 'bounds 0x0050\n' | nc -U /run/part8-recovery/<instance>/debug.sock
+# oldest/oldest_servable drift at wall-clock rate on a full ring;
+# use too_old_probe for TOO_OLD and newest for OK
+live_ext_seq=252661 resident=24896 oldest_servable_ext=227765
+pid 0x0050 count=2048 servable=268 oldest=449505259 newest=452538243
+    oldest_servable=452142230 too_old_probe=450824705
+    history_ms=33700 servable_ms=4400 epoch=0 epochs=1
 ```
+
+**Which value to use for which test.** This matters more than it looks, and
+getting it wrong produces a right answer for a wrong reason:
+
+| value | use it for | margin before it goes stale |
+|---|---|---|
+| `newest` | the **OK** case | one buffer, ~4.4 s |
+| `too_old_probe` | the **TOO_OLD** case | roughly half the pre-buffer history, ~15 s |
+| `oldest`, `oldest_servable` | **nothing** — see below | none |
+
+`oldest` is the ring's eviction frontier. On a full ring it advances at
+wall-clock rate, so it is stale the moment it is read. Measured: resolving it
+after 50 / 200 / 1000 / 3000 ms drifts by 45 / 207 / 988 / 3012 ms -- **the drift
+equals the delay**. At a delay of ~0 it does return `TOO_OLD` correctly; by hand
+it never will, and it degrades through `BEFORE_EPOCH` to `OUTSIDE_BUFFER` as the
+delay grows. `oldest_servable` is worse, ageing out within seconds at 5,618
+payloads/s: an early attempt to use it returned `TOO_OLD` correctly but for the
+wrong reason, because 40 s had elapsed between the two commands.
+
+`too_old_probe` is a real entry midway between the oldest and the first still
+servable one -- comfortably inside the ring, comfortably past the buffer.
+Verified stable across delays of 0 to 10 s while `oldest` degraded over the same
+span.
 
 Spans are measured **within the newest epoch only** -- a PCR difference across a
 discontinuity is meaningless because the clock restarted -- and `epochs=` says
 whether the ring currently spans more than one.
 
-`resolve` accepts either `0x0731` or `1841`.
+`resolve` accepts either `0x0050` or `80`.
+
+## Sanity figures worth checking on a live instance
+
+`servable` should sit near `buffer_ms / PCR_interval`: about 111 entries for a
+39.6 ms PID at a 4.4 s buffer, about 268 for a 16.4 ms PID. If it is far off,
+librist's reported residency and the ring disagree about what can be served, and
+that is worth investigating rather than explaining away.
 
 ## Coverage note
 
