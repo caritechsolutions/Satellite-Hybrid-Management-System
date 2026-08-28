@@ -21,7 +21,11 @@ LOG_DIR="/var/log/rist-monitor"
 PORT="${PORT:-80}"
 
 # Files that hold runtime state and must survive a code update
-STATE_FILES="rist-monitor/config/transports.json rist-monitor/config/channels.json rist-monitor/config/satellites.json rist-monitor/data/receivers.json"
+# part8-monitor/config/instances.json is gitignored and so survives the
+# reset --hard on a re-run, but it is listed explicitly anyway: the fresh-install
+# path does rm -rf on APP_DIR, and relying on "untracked files happen to
+# survive" is the kind of assumption that holds until someone adds a git clean.
+STATE_FILES="rist-monitor/config/transports.json rist-monitor/config/channels.json rist-monitor/config/satellites.json rist-monitor/data/receivers.json part8-monitor/config/instances.json"
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -358,29 +362,48 @@ P8_STATE_AFTER="/tmp/part8-units-after.txt"
 P8_PORT="${P8_PORT:-8801}"
 
 capture_rist_state() {
+    # EVERY service, not just rist*/part8*. rist-mcast-bridge.service already
+    # showed that Part 7 does not all share one prefix; a pattern can only see
+    # what was anticipated, so capture everything and classify afterwards.
     {
-        systemctl list-units --type=service --all --plain --no-legend \
-            'rist*' 'part8*' 2>/dev/null | awk '{print $1, $2, $3, $4}'
-        echo "---enabled-state---"
-        systemctl list-unit-files --no-legend 'rist*' 'part8*' 2>/dev/null \
-            | awk '{print $1, $2}'
-        echo "---main-pids---"
-        for u in $(systemctl list-units --type=service --all --plain --no-legend 'rist*' 2>/dev/null | awk '{print $1}'); do
-            printf '%s %s\n' "$u" "$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
+        systemctl list-units --type=service --all --plain --no-legend 2>/dev/null \
+            | awk '{print "U", $1, $2, $3, $4}'
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+            | awk '{print "F", $1, $2}'
+        for u in $(systemctl list-units --type=service --all --plain --no-legend 'rist*' 'part8*' 2>/dev/null | awk '{print $1}'); do
+            printf 'P %s %s\n' "$u" "$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
         done
-    } | sort
+    } 2>/dev/null | sort
 }
+
 capture_rist_state > "$P8_STATE_BEFORE"
 info "captured pre-install unit state ($(wc -l < "$P8_STATE_BEFORE") lines)"
 
-# --- receive buffer ceiling (applies to every instance)
-cat > /etc/sysctl.d/99-part8-recovery.conf <<'SYSCTL'
-# Part 8 recovery servers ingest full multiplexes; the default rmem_max clamps
-# their SO_RCVBUF request to 8 MB and input is lost on burst.
-net.core.rmem_max = 33554432
-SYSCTL
-sysctl -q -w net.core.rmem_max=33554432 2>/dev/null || warn "could not set rmem_max now"
-info "net.core.rmem_max = $(cat /proc/sys/net/core/rmem_max)"
+# --- receive buffer ceiling: CHECKED, NOT SET
+# Deliberately not written and not applied. Raising net.core.rmem_max is a
+# system-wide change to a running headend, and doing it as a side effect of an
+# installer is the same class of surprise as the silent clamp it protects
+# against. The default is 212992 -- about 28 ms of ingest at 59 Mb/s -- so a
+# host that has not been raised WILL clamp, and this says so loudly with the
+# command to fix it. Pass P8_SET_RMEM=1 to have the installer apply it.
+P8_WANT_RMEM=33554432
+P8_HAVE_RMEM="$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo 0)"
+if [ "$P8_HAVE_RMEM" -ge "$P8_WANT_RMEM" ]; then
+    info "net.core.rmem_max = ${P8_HAVE_RMEM} (adequate; SO_RCVBUF will not clamp)"
+elif [ "${P8_SET_RMEM:-0}" = "1" ]; then
+    printf 'net.core.rmem_max = %s\n' "$P8_WANT_RMEM" > /etc/sysctl.d/99-part8-recovery.conf
+    sysctl -q -w net.core.rmem_max="$P8_WANT_RMEM" 2>/dev/null \
+        || warn "could not apply rmem_max now"
+    info "net.core.rmem_max raised to $(cat /proc/sys/net/core/rmem_max) (P8_SET_RMEM=1)"
+else
+    warn "net.core.rmem_max is ${P8_HAVE_RMEM}, below ${P8_WANT_RMEM}."
+    warn "  Every instance's SO_RCVBUF request WILL be clamped and input will be"
+    warn "  lost on burst. At 59 Mb/s ${P8_HAVE_RMEM} bytes is about $(( P8_HAVE_RMEM * 8 * 1000 / 59145890 )) ms of ingest."
+    warn "  Fix, persistently:"
+    warn "    echo 'net.core.rmem_max = ${P8_WANT_RMEM}' > /etc/sysctl.d/99-part8.conf"
+    warn "    sysctl -w net.core.rmem_max=${P8_WANT_RMEM}"
+    warn "  Each instance logs what it ACHIEVED at startup; check there, do not assume."
+fi
 
 # --- templated unit
 if [ -f "${APP_DIR}/part8-recovery@.service" ]; then
@@ -473,74 +496,23 @@ fi
 
 # --- isolation check: what actually changed
 capture_rist_state > "$P8_STATE_AFTER"
-say "Isolation check: what changed in rist*/part8* unit state"
+say "Isolation check: what changed in unit state"
 if diff -u "$P8_STATE_BEFORE" "$P8_STATE_AFTER" > /tmp/part8-units-diff.txt 2>&1; then
     info "NOTHING changed at all"
 else
-    _touched="$(grep -E '^[+-][^+-]' /tmp/part8-units-diff.txt | grep -vE 'part8' || true)"
-    if [ -z "$_touched" ]; then
-        info "ONLY part8 lines differ - no existing rist* unit changed"
-        { grep -E '^\+[^+]' /tmp/part8-units-diff.txt || true; } | sed 's/^/        /'
+    _changed="$(grep -E '^[+-][^+-]' /tmp/part8-units-diff.txt | grep -v 'part8' || true)"
+    _rist="$(printf '%s\n' "$_changed" | grep -E 'rist' || true)"
+    _other="$(printf '%s\n' "$_changed" | grep -vE 'rist' | grep -v '^$' || true)"
+    if [ -n "$_rist" ]; then
+        warn "A PART 7 UNIT CHANGED - this should not happen:"
+        printf '%s\n' "$_rist" | sed 's/^/        /'
     else
-        warn "an EXISTING unit changed - this should not happen:"
-        printf '%s\n' "$_touched" | sed 's/^/        /'
+        info "no rist* unit changed state, enablement or main PID"
     fi
+    if [ -n "$_other" ]; then
+        info "other units that moved during the install (informational):"
+        printf '%s\n' "$_other" | head -12 | sed 's/^/        /'
+    fi
+    { grep -E '^\+[^+]' /tmp/part8-units-diff.txt | grep 'part8' || true; } | sed 's/^/        added: /'
     info "full diff: /tmp/part8-units-diff.txt"
 fi
-
-# ---------------------------------------------------------------- nginx
-say "Configuring nginx"
-cat > "/etc/nginx/sites-available/${SITE_NAME}" <<NGINX
-server {
-    listen ${PORT} default_server;
-    listen [::]:${PORT} default_server;
-    server_name _;
-    root ${WEB_ROOT};
-    index index.php index.html;
-    charset utf-8;
-
-    access_log /var/log/nginx/${SITE_NAME}.access.log;
-    error_log  /var/log/nginx/${SITE_NAME}.error.log;
-
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
-
-    location ~ \.php\$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:${PHP_SOCK};
-        fastcgi_read_timeout 120;
-    }
-
-    location /assets/ { expires 7d; add_header Cache-Control "public"; }
-
-    location ~ ^/(config|data)/ { deny all; }
-    location ~ /\.git { deny all; }
-    location ~ /\.    { deny all; }
-
-    add_header X-Frame-Options "SAMEORIGIN";
-    add_header X-Content-Type-Options "nosniff";
-}
-NGINX
-
-rm -f /etc/nginx/sites-enabled/default
-ln -sf "/etc/nginx/sites-available/${SITE_NAME}" "/etc/nginx/sites-enabled/${SITE_NAME}"
-nginx -t >/dev/null 2>&1 || die "nginx config test failed - run 'nginx -t'"
-systemctl enable --now nginx >/dev/null 2>&1 || true
-systemctl enable --now "php${PHP_VER}-fpm" >/dev/null 2>&1 || true
-systemctl reload nginx
-info "site live on port ${PORT}"
-
-# ---------------------------------------------------------------- done
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-say "Done"
-if [ "$PORT" = "80" ]; then URL="http://${IP:-<server-ip>}/"; else URL="http://${IP:-<server-ip>}:${PORT}/"; fi
-info "web ui   : ${URL}"
-info "code     : ${APP_DIR} (git ${BRANCH})"
-info "binaries : /usr/local/bin/{ristsender,ristreceiver,ristreceiver_with_markers,headend_part7_sender,part8_recovery_server,rist_watchdog}"
-info "tsduck   : $(command -v tsp >/dev/null 2>&1 && tsp --version 2>&1 | head -1 || echo \"not installed\")"
-info "app log  : ${LOG_DIR}/rist-monitor.log"
-info "unit log : journalctl -u ristsender-<channel> -f"
-echo
-info "This server's IP is ${IP:-unknown} - the sender advertises it for both"
-info "the weight-0 and weight-1000 peers."
-info "Add your admin IP to ALLOWED_IPS in rist-monitor/config/config.php."
-echo

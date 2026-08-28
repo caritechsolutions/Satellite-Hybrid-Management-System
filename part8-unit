@@ -41,14 +41,19 @@ valid_name() {
 }
 
 snapshot() {
+    # EVERY service, not just rist*. A name-pattern snapshot can only see units
+    # whose names were anticipated; rist-mcast-bridge.service already proved that
+    # Part 7 does not all share one prefix, and the next one might share none.
+    # Capturing everything removes the question. MainPID is captured only for
+    # rist*/part8* because that is where a silent restart matters, and 200
+    # systemctl show calls would make every button press slow.
     {
-        systemctl list-units --type=service --all --plain --no-legend 'rist*' 'part8*' 2>/dev/null \
-            | awk '{print $1, $2, $3, $4}'
-        echo "---enabled---"
-        systemctl list-unit-files --no-legend 'rist*' 'part8*' 2>/dev/null | awk '{print $1, $2}'
-        echo "---mainpid---"
-        for u in $(systemctl list-units --type=service --all --plain --no-legend 'rist*' 2>/dev/null | awk '{print $1}'); do
-            printf '%s %s\n' "$u" "$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
+        systemctl list-units --type=service --all --plain --no-legend 2>/dev/null \
+            | awk '{print "U", $1, $2, $3, $4}'
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+            | awk '{print "F", $1, $2}'
+        for u in $(systemctl list-units --type=service --all --plain --no-legend 'rist*' 'part8*' 2>/dev/null | awk '{print $1}'); do
+            printf 'P %s %s\n' "$u" "$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
         done
     } 2>/dev/null | sort
 }
@@ -58,13 +63,27 @@ snapshot() {
 # so a change to a Part 7 unit is reported loudly rather than assumed impossible.
 report_diff() {
     local before="$1" after="$2"
-    local touched
-    touched="$(diff "$before" "$after" 2>/dev/null | grep -E '^[<>]' | grep -v 'part8' || true)"
-    if [ -n "$touched" ]; then
+    local changed rist other
+    changed="$(diff "$before" "$after" 2>/dev/null | grep -E '^[<>]' | grep -v 'part8' || true)"
+    if [ -z "$changed" ]; then
+        echo "PART7-UNCHANGED"
+        return
+    fi
+    # Two tiers. A rist* unit moving is the failure this whole deployment is
+    # built to avoid, so it is a hard verdict. Anything else that moved is
+    # reported as context rather than an alarm -- unrelated system churn during
+    # a button press would otherwise cry wolf and train everyone to ignore it.
+    rist="$(printf '%s\n' "$changed" | grep -E 'rist' || true)"
+    other="$(printf '%s\n' "$changed" | grep -vE 'rist' || true)"
+    if [ -n "$rist" ]; then
         echo "PART7-CHANGED"
-        printf '%s\n' "$touched"
+        printf '%s\n' "$rist"
     else
         echo "PART7-UNCHANGED"
+    fi
+    if [ -n "$other" ]; then
+        echo "OTHER-UNITS-CHANGED (informational, not Part 7)"
+        printf '%s\n' "$other" | head -20
     fi
 }
 
