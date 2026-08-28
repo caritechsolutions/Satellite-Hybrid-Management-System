@@ -25,10 +25,41 @@ function ago(sec) {
   return Math.floor(d / 86400) + 'd ago';
 }
 
+/*
+ * Never let a non-JSON response throw. A 500 with an empty body used to surface
+ * as "Unexpected end of JSON input" in the console and nothing in the UI, which
+ * meant reading the PHP-FPM log to learn anything. Whatever comes back, this
+ * returns an object the caller can render.
+ */
 async function api(params) {
   const q = new URLSearchParams(params);
-  const r = await fetch('api.php?' + q.toString(), { cache: 'no-store' });
-  return r.json();
+  let r, text;
+  try {
+    r = await fetch('api.php?' + q.toString(), { cache: 'no-store' });
+    text = await r.text();
+  } catch (e) {
+    return { ok: false, error: 'Could not reach api.php: ' + e.message };
+  }
+  if (!text.trim()) {
+    return { ok: false,
+             error: `api.php returned HTTP ${r.status} with an EMPTY body.\n` +
+                    `That is a PHP fatal before any output, or php-fpm refusing ` +
+                    `the request. Check: journalctl -u php*-fpm -n 50` };
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    return { ok: false,
+             error: `api.php returned HTTP ${r.status} with a non-JSON body:\n` +
+                    text.slice(0, 600) };
+  }
+}
+
+function showError(msg) {
+  const el = $('#isolation');
+  el.classList.remove('hidden');
+  el.classList.remove('ok');
+  el.textContent = msg;
 }
 
 function showIsolation(text, name) {
@@ -269,7 +300,7 @@ async function openForm(name) {
     $('#fSel').checked = true;
     const p = await api({ action: 'suggest_port' });
     $('#fPort').value = p.ok ? p.port : '';
-    if (!p.ok) showFormErr(p.error);
+    if (!p.ok) showFormErr(p.error + (p.where ? '\n  at ' + p.where : ''));
   }
   $('#modal').classList.remove('hidden');
 }
@@ -298,7 +329,7 @@ $('#frm').addEventListener('submit', async ev => {
     require_selection: $('#fSel').checked ? 1 : ''
   });
   $('#frmSave').disabled = false;
-  if (!r.ok) return showFormErr(r.error);
+  if (!r.ok) return showFormErr(r.error + (r.where ? '\n  at ' + r.where : ''));
   showIsolation(r.isolation, (editing ? 'update ' : 'create ') + $('#fName').value.trim());
   $('#modal').classList.add('hidden');
   tick();
@@ -313,8 +344,13 @@ async function tick() {
   try {
     const r = await api({ action: 'list' });
     if (r.ok) render(r.instances || []);
+    else if (r && r.error) {
+      showError('list failed: ' + r.error + (r.where ? '\n  at ' + r.where : ''));
+      $('#summary').textContent = 'API error';
+    }
   } catch (e) {
     $('#summary').textContent = 'API unreachable';
+    showError('Unexpected UI error: ' + e.message);
   } finally {
     busy = false;
   }

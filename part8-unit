@@ -141,11 +141,34 @@ case "$ACTION" in
         cat > "$tmp"
         grep -qE '^P8_INPUT=' "$tmp"  || { rm -f "$tmp"; die "config missing P8_INPUT"; }
         grep -qE '^P8_LISTEN=' "$tmp" || { rm -f "$tmp"; die "config missing P8_LISTEN"; }
-        install -m 0644 -o root -g root "$tmp" "${ENV_DIR}/${NAME}.env"
+
+        # Validate BEFORE installing. Everything that can refuse this config
+        # happens while nothing has been written, so a refusal leaves no trace.
+        NEW_ENV="${ENV_DIR}/${NAME}.env"
+        EXISTED=0; [ -f "$NEW_ENV" ] && EXISTED=1
+        install -m 0644 -o root -g root "$tmp" "$NEW_ENV"
         rm -f "$tmp"
-        systemctl daemon-reload
+
+        # From here the file exists, so anything that fails must undo it --
+        # otherwise systemd can see an instance the UI has no record of, which is
+        # worse than a clean refusal. Only remove it if WE created it.
+        cleanup_env() {
+            if [ "$EXISTED" = "0" ]; then
+                rm -f "$NEW_ENV"
+                echo "rolled back ${NEW_ENV}" >&2
+            fi
+        }
+        trap 'cleanup_env' EXIT
+
+        # daemon-reload is NOT required for an env-file-only change: systemd
+        # reads EnvironmentFile when the unit starts, not when it is reloaded.
+        # It is done for tidiness, so its failure must not orphan the config.
+        systemctl daemon-reload 2>/dev/null || \
+            echo "note: daemon-reload failed (not required for this change)" >&2
+
         snapshot > "$AFTER"
         report_diff "$BEFORE" "$AFTER"
+        trap 'rm -f "$BEFORE" "$AFTER"' EXIT     # success: keep the config
         ;;
 
     remove)
@@ -153,7 +176,11 @@ case "$ACTION" in
         systemctl stop "$UNIT" 2>/dev/null || true
         systemctl disable "$UNIT" 2>/dev/null || true
         rm -f "${ENV_DIR}/${NAME}.env"
-        systemctl daemon-reload
+        # Non-fatal for the same reason as in create: daemon-reload is tidiness,
+        # not a requirement, and letting it fail the whole action left the config
+        # deleted while the UI still listed the instance.
+        systemctl daemon-reload 2>/dev/null || \
+            echo "note: daemon-reload failed (not required for this change)" >&2
         snapshot > "$AFTER"
         report_diff "$BEFORE" "$AFTER"
         ;;

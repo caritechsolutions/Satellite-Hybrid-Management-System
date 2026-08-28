@@ -59,9 +59,19 @@ function p8_valid_name(string $n): bool
  *   4. the instance's own input    - the input is a UDP listener too, and a
  *                                    listen/input clash is the one people miss
  */
-function p8_ports_in_use(?string $exclude = null): array
+function p8_whoami(): string
+{
+    if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+        $pw = @posix_getpwuid(posix_geteuid());
+        if (is_array($pw) && isset($pw['name'])) return $pw['name'];
+    }
+    return (string)(getenv('USER') ?: 'the web user');
+}
+
+function p8_ports_in_use(?string $exclude = null, ?array &$problems = null): array
 {
     $used = [];
+    if ($problems === null) $problems = [];
 
     // 1. our own registry
     foreach (p8_instances() as $name => $inst) {
@@ -71,8 +81,19 @@ function p8_ports_in_use(?string $exclude = null): array
         if ($ip) $used[$ip] = "part8 instance '$name' input";
     }
 
-    // 2. Part 7 unit files -- parse ExecStart of every unit we do not own
+    // 2. Part 7 unit files -- parse ExecStart of every unit we do not own.
+    //    A unit that systemd knows about but which has NO unit file (a stale
+    //    not-found reference like ristmarker-bbc.service) simply does not appear
+    //    here, which is correct: it owns no ports because it cannot start.
+    if (!is_readable('/etc/systemd/system')) {
+        $problems[] = '/etc/systemd/system is not readable as ' . p8_whoami()
+                    . ' -- Part 7 ports cannot be checked';
+    }
     foreach (glob('/etc/systemd/system/rist*.service') ?: [] as $f) {
+        if (!is_readable($f)) {
+            $problems[] = "$f is not readable as " . p8_whoami();
+            continue;
+        }
         $body = (string)@file_get_contents($f);
         if ($body === '') continue;
         $unit = basename($f);
@@ -87,9 +108,23 @@ function p8_ports_in_use(?string $exclude = null): array
     // 2b. the SHMS channel config, for channels whose units are not written yet
     foreach (['/opt/shms/rist-monitor/config/channels.json',
               '/opt/shms/rist-monitor/config/transports.json'] as $cf) {
-        if (!is_readable($cf)) continue;
-        $j = json_decode((string)file_get_contents($cf), true);
-        array_walk_recursive($j ?: [], function ($v, $k) use (&$used) {
+        if (!file_exists($cf)) continue;               // absent is fine
+        if (!is_readable($cf)) {                        // present but unreadable is NOT
+            $problems[] = "$cf exists but is not readable as " . p8_whoami();
+            continue;
+        }
+        $raw = file_get_contents($cf);
+        if ($raw === false) { $problems[] = "could not read $cf"; continue; }
+        $decoded = json_decode((string)$raw, true);
+        if (!is_array($decoded)) {
+            $problems[] = "$cf is not valid JSON (" . json_last_error_msg() . ")";
+            continue;
+        }
+        // array_walk_recursive takes its first argument BY REFERENCE, so it must
+        // be a variable. Passing `$j ?: []` is a fatal at runtime, not a parse
+        // error, which is why php -l passed and why this only fired on a host
+        // where the file actually exists.
+        array_walk_recursive($decoded, function ($v, $k) use (&$used) {
             if (is_numeric($v) && stripos((string)$k, 'port') !== false) {
                 $p = (int)$v;
                 if ($p >= 1 && $p <= 65535 && !isset($used[$p])) $used[$p] = 'SHMS channel config';
@@ -98,9 +133,16 @@ function p8_ports_in_use(?string $exclude = null): array
     }
 
     // 3. anything actually bound, per the kernel
+    $sawSocketTable = false;
     foreach (['/proc/net/udp', '/proc/net/udp6', '/proc/net/tcp', '/proc/net/tcp6'] as $pf) {
+        if (!file_exists($pf)) continue;                 // IPv6 disabled, say
+        if (!is_readable($pf)) {
+            $problems[] = "$pf is not readable as " . p8_whoami();
+            continue;
+        }
         $lines = @file($pf, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
         if (!$lines) continue;
+        $sawSocketTable = true;
         foreach (array_slice($lines, 1) as $l) {
             $f = preg_split('/\s+/', trim($l));
             if (count($f) < 2 || strpos($f[1], ':') === false) continue;
@@ -108,6 +150,10 @@ function p8_ports_in_use(?string $exclude = null): array
             if ($p >= 1 && $p <= 65535 && !isset($used[$p])) $used[$p] = 'already bound';
         }
     }
+
+    if (!$sawSocketTable)
+        $problems[] = 'no /proc/net socket table could be read -- ports already '
+                    . 'bound by other processes cannot be seen';
 
     return $used;
 }
@@ -119,16 +165,30 @@ function p8_port_of_url(string $url): ?int
     return null;
 }
 
-/** Refuse rather than guess. Returns [port, null] or [null, reason]. */
+/**
+ * Refuse rather than guess. Returns [port, null] or [null, reason].
+ *
+ * If any source that could hold a conflicting port could not be read, this
+ * REFUSES rather than allocating. Handing out a port while blind to one of the
+ * four sources is how a Part 8 instance would end up on a Part 7 port -- the
+ * exact failure the rule exists to prevent -- and it would look like a working
+ * allocation until something collided at runtime.
+ */
 function p8_alloc_port(?string $exclude = null): array
 {
+    $problems = [];
+    $used = p8_ports_in_use($exclude, $problems);
+    if ($problems) {
+        return [null, "cannot allocate a port safely:\n  - " . implode("\n  - ", $problems)
+                    . "\nRefusing rather than risk a collision with a Part 7 port."];
+    }
+
     // The ephemeral range can be reconfigured; re-read it instead of trusting
     // the constant chosen when this was written.
     $eph = @file_get_contents('/proc/sys/net/ipv4/ip_local_port_range');
     $lo = $hi = 0;
     if ($eph && preg_match('/(\d+)\s+(\d+)/', $eph, $m)) { $lo = (int)$m[1]; $hi = (int)$m[2]; }
 
-    $used = p8_ports_in_use($exclude);
     for ($p = P8_PORT_MIN; $p <= P8_PORT_MAX; $p++) {
         if (isset($used[$p])) continue;
         if ($lo && $p >= $lo && $p <= $hi) continue;   // inside the ephemeral range
@@ -141,11 +201,52 @@ function p8_alloc_port(?string $exclude = null): array
         P8_PORT_MAX - P8_PORT_MIN + 1)];
 }
 
+/**
+ * Readability of everything the allocator depends on, for the diag endpoint.
+ * Reported rather than assumed: this app runs as www-data on a production host,
+ * not as root in a container, and that difference is what broke the first run.
+ */
+function p8_diagnostics(): array
+{
+    $out = ['user' => p8_whoami(), 'sources' => [], 'problems' => []];
+    $paths = [
+        '/etc/systemd/system'                              => 'Part 7 unit files (directory)',
+        '/proc/net/udp'                                    => 'bound UDP sockets',
+        '/proc/net/tcp'                                    => 'bound TCP sockets',
+        '/proc/sys/net/ipv4/ip_local_port_range'           => 'ephemeral port range',
+        '/opt/shms/rist-monitor/config/channels.json'      => 'SHMS channel config',
+        P8_ENV_DIR                                         => 'instance env files',
+        P8_RUN_DIR                                         => 'instance debug sockets',
+        dirname(P8_STORE)                                  => 'instance store (must be WRITABLE)',
+        P8_HELPER                                          => 'privilege helper',
+    ];
+    foreach ($paths as $p => $what) {
+        $out['sources'][] = [
+            'path' => $p, 'purpose' => $what,
+            'exists' => file_exists($p),
+            'readable' => is_readable($p),
+            'writable' => is_writable($p),
+        ];
+    }
+    $problems = [];
+    p8_ports_in_use(null, $problems);
+    $out['problems'] = $problems;
+
+    // The helper is the only privileged path; prove it answers before an
+    // operator discovers otherwise by clicking Start.
+    $h = p8_helper('list');
+    $out['helper'] = ['rc' => $h['rc'], 'output' => substr($h['out'], 0, 400)];
+    return $out;
+}
+
 /** Explicit check for a user-supplied port. Returns null if free, else why not. */
 function p8_port_conflicts(int $port, ?string $exclude = null): ?string
 {
     if ($port < 1 || $port > 65535) return 'out of range';
-    $used = p8_ports_in_use($exclude);
+    $problems = [];
+    $used = p8_ports_in_use($exclude, $problems);
+    if ($problems)
+        return "cannot verify this port: " . implode('; ', $problems);
     if (isset($used[$port])) return $used[$port];
     if ($port < P8_PORT_MIN || $port > P8_PORT_MAX)
         return sprintf('outside the Part 8 block %d-%d', P8_PORT_MIN, P8_PORT_MAX);
