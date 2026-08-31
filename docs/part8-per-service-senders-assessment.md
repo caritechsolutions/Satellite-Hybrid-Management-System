@@ -5,10 +5,12 @@ Attacking the proposal, as asked. Verdict up front:
 **The shape is right and I would build it. But step 8 is necessary and not
 sufficient — there are four further divergences, and one of them makes "one
 anchor holds indefinitely" false. None of them sends us back to STC-NACK; they
-change the anchor from one-shot to periodic and self-validating. Separately, A5
-contains a live librist units bug that would have made the whole withheld-hole
-mechanism fail in the field in a way that looks like "the server never
-answered".**
+change the anchor from one-shot to periodic and self-validating. A5's retry budget is a
+comfortable 4.4 s and the NACK routing already reaches the server, so the
+withheld-hole mechanism itself is well supported.**
+
+*(An earlier revision of this document reported a units bug in A5's retry pacing.
+That was wrong and is retracted in place -- see the A5 section.)*
 
 ---
 
@@ -244,7 +246,37 @@ transmitted to the recovery peer, but every *policy* decision about it reads the
 local peer's config: `max_retries`, `recovery_mode`, `buffer_bloat_active`, and
 the RTT used for retry pacing. That is what the next section is about.
 
-### The loss timeout, and the bug
+### The loss timeout
+
+> **RETRACTED — this section originally reported a units bug in
+> `rist_process_nack()` and it was wrong.** The claim was that
+> `recovery_rtt_min`/`_max` are millisecond constants being compared against an
+> NTP-unit RTT, collapsing the retry interval to nanoseconds. The reasoning is
+> kept below the corrected text because the failure mode it describes is real
+> whenever those units *do* get mixed, and because the way it was disproved is
+> the useful part.
+>
+> **Why it was wrong:** `peer->config.recovery_rtt_min/max` are stored in **NTP
+> units**, converted at configuration time (`rist-common.c:4348-4351`):
+>
+> ```c
+> peer->config.recovery_rtt_max = settings->recovery_rtt_max * RIST_CLOCK;
+> peer->config.recovery_rtt_min = recovery_rtt_min * RIST_CLOCK;
+> ```
+>
+> The millisecond values live in `settings->`, the user-facing API struct;
+> `config->` holds them already scaled. `rist-common.c:298` and `:332-334`
+> confirm it independently by dividing `config.recovery_rtt_min` **by**
+> `RIST_CLOCK` to print milliseconds. Both sides of the clamp are NTP units, and
+> so are `now` and `rtt` at the assignment. **The active line is correct.** The
+> error was checking the printing side and not the storing side, and reporting
+> before that was done.
+>
+> The line is also **stock upstream librist 0.2.12, byte-identical**, including
+> the commented-out variant above it, which arrived already commented out in the
+> `9eb34ed "added librist"` vendoring import. Restoring the commented line would
+> multiply an already-NTP value by `RIST_CLOCK` again and push the next retry
+> roughly ten days into the future — no retry would ever be sent.
 
 Two independent give-up conditions in `rist_process_nack()`
 (`rist-common.c:724-793`):
@@ -258,53 +290,28 @@ if ((now - b->insertion_time) > (recovery_buffer_ticks * 1.1))    return 9;
 buffer**, so ~4.4 s at a 4000 ms buffer. Separately the *output* deadline is
 `target_output_time = packet_time + recovery_buffer_ticks` (`rist-common.c:441`),
 i.e. the hole is released at one buffer depth. **The hold line is bounded by the
-receiver buffer itself — ~4 s — not by a separate shorter timeout.** That is the
-number you asked for and it is comfortable.
+receiver buffer itself — ~4 s — not by a separate shorter timeout.**
 
-**Except that the retry budget is exhausted long before any of it is used.**
+The retry pacing is correct and, better, self-consistent. `min_rtt =
+recovery_length_min / max_retries` = 4000/20 = **200 ms** overrides the 5 ms
+default (`:4338-4343`), so the clamp is [200 ms, 500 ms]:
 
-```c
-uint64_t rtt = (peer->eight_times_rtt / 8);
-if (rtt < peer->config.recovery_rtt_min)  rtt = peer->config.recovery_rtt_min;   /* 5   */
-else if (rtt > peer->config.recovery_rtt_max) rtt = peer->config.recovery_rtt_max; /* 500 */
-...
-b->next_nack = now + (uint64_t)(rtt * 1.1);
-```
+| peer | measured RTT | after clamp | next retry |
+|---|---|---|---|
+| LAN peer | 0.14 / 0.23 ms | ↑ 200 ms | 220 ms |
+| STB good mode | 32–68 ms | ↑ 200 ms | 220 ms |
+| STB bad mode | 1.0–1.8 s | ↓ 500 ms | 550 ms |
 
-`peer->last_rtt` and `eight_times_rtt` are in **NTP units** — `calculate_rtt_delay()`
-(`proto/rist_time.c:91-98`) returns `response - request` with both operands NTP,
-and `stats.c:82` divides by `RIST_CLOCK` to print milliseconds. But
-`recovery_rtt_min`/`_max` are **millisecond** constants (5 and 500, `peer.h:34-35`).
+Good mode: 20 retries × 220 ms = **4,400 ms**, against an age deadline of
+1.1 × 4000 = **4,400 ms**. They coincide exactly — `min_rtt = buffer/max_retries`
+is precisely what makes 20 retries at 1.1× spacing fill the buffer. Deliberate,
+not accidental.
 
-So the clamp compares NTP units against milliseconds. A real RTT of 0.14 ms is
-601,295 NTP units, so **every real RTT is clamped down to 500 NTP units = 116
-nanoseconds.** Then `next_nack = now + 550` NTP units ≈ 128 ns — always already
-in the past.
-
-**Consequence: every missing packet is re-NACKed on every pass of
-`receiver_nack_output()`, and `max_retries = 20` is burned in twenty passes** —
-milliseconds — after which `rist_process_nack` returns 8 and the packet is
-abandoned with ~4 s of buffer still unused.
-
-The commented-out line immediately above it is the correct one:
-
-```c
-//b->next_nack = now + (uint64_t)rtt * (uint64_t)ratio * (uint64_t)RIST_CLOCK;
-```
-
-`RIST_CLOCK` is present there and absent from the live line. This is the **same
-units defect family** we already found and fixed in `udp.c` (`5000000000ULL` →
-`5000ULL * RIST_CLOCK`) — a millisecond constant meeting an NTP-unit value.
-
-The same mixed comparison appears again at `rist-common.c:1979-1990`, governing
-the reorder buffer, so the out-of-order-vs-missing decision is affected too.
-
-**Why it has not bitten yet:** in Part 7 the recovery peer delivers full-stream
-under FSR and ordinary NACK-driven repair is barely exercised — consistent with
-the `recovered=0` we measured. This proposal makes NACK the *primary* mechanism,
-so it moves from latent to load-bearing. It is fixable, it is small, and it must
-be fixed before any of this is tested, or every result will look like "the server
-did not answer in time".
+Bad mode: the age deadline fires first, at ~8 retries. With a true RTT of
+1.0–1.8 s and retries every 550 ms, retries 2–3 go out before the first reply
+could arrive — bounded waste caused by the `recovery_rtt_max = 500 ms` ceiling.
+That is a **tuning observation, not a defect**: raise `recovery_rtt_max` if bad
+mode should retry at its real RTT.
 
 ### Will librist reliably NACK a withheld range?
 
@@ -395,12 +402,9 @@ piece to design once Q1 is answered — not before.
 
 ## What I would do next, in order
 
-1. **Fix the librist NACK pacing units bug** (A5). Everything downstream measures
-   nothing until this is right, and it is a small, well-understood fix of a class
-   we have already handled once.
-2. **Answer TEI at the dish** (D3). It gates whether box-side loss is countable,
+1. **Answer TEI at the dish** (D3). It gates whether box-side loss is countable,
    which is the basis of the whole alignment.
-3. **Build A7's fallback and cut-over first.** It de-risks the fleet, and it is
+2. **Build A7's fallback and cut-over first.** It de-risks the fleet, and it is
    also the zap fix.
-4. Then the per-service senders as a layer (A3), with the derived PID contract
+3. Then the per-service senders as a layer (A3), with the derived PID contract
    (A2) and the periodic self-validating anchor (A1/A4).
