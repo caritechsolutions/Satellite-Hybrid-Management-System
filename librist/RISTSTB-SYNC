@@ -1,0 +1,35 @@
+# librist sync manifest — this repo's librist/ vs the riststb tree.
+#
+# riststb commit : 4501700f1ea26c352b58e616550768072ee973ea
+# riststb branch : claude/gx6631-ts-userspace-rist-fe2wkc
+# generated      : 2026-09-04T20:43:42Z
+#
+# Regenerate with ./librist-sync-update.sh <riststb-checkout>.
+# install.sh checks this and refuses to build on a mismatch.
+#
+# sha256  <hex>  <path>            file must be byte-identical to riststb
+# require <path> <literal>         literal must appear at least once
+# forbid  <path> <literal>         literal must not appear
+#
+# require/forbid cover src/rist-common.c and src/udp.c, which carry
+# per-tree work and so cannot be hashed whole. They pin the fixes that
+# are shared between the trees — the ones that have already gone
+# missing on one side once.
+
+riststb 4501700f1ea26c352b58e616550768072ee973ea
+
+sha256	e94817520bdab551fa85a75fd46d863b75a858572b8649e0443ce6e81fc8a902	src/pcr_cut.c
+sha256	029df17e3fa14f12adbcbd0e68dbf39a9f379331872cbb1f90a821d54745a672	src/pcr_cut.h
+sha256	870f51f6a975a2e09a862ba9100ca276e28a2446779602152f9cda255579f622	src/program-selection.c
+sha256	c4fb4d940683a7501f2e861c363af951ca0ccbfe3b81026c94a335a7d5a6bf4c	src/program-selection.h
+sha256	c83bc94cb9c0cfab71b16e48be3ea86189c53c5e3e39f3cd02828025216b38ba	include/librist/headers.h
+sha256	570fdfb81e5fca61c30a2a9ac368f73dd73f63d76568d00f48f63afb8e387057	include/librist/urlparam.h
+sha256	02abf1748b5e9b59f5e3daa71baf5ed6157ff9daf76ad1b47459d38de9f03e1c	tools/ristsender.c
+
+require	src/rist-common.c	if (check->last_rtt != 0 && check->last_rtt < recovery_agent_rtt)
+require	src/rist-common.c	program_selection_selection_unchanged(p->adv_peer_id, content_str)
+require	src/udp.c	5000ULL * RIST_CLOCK
+require	src/udp.c	10000ULL * RIST_CLOCK
+forbid	src/udp.c	> 5000000000ULL
+forbid	src/udp.c	> 10000000000ULL
+require	src/rist-common.c	RIST_URL_PARAM_PCR_CUT
