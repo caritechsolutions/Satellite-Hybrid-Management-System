@@ -39,6 +39,14 @@ try {
             } elseif (isset($_GET['stats'])) {
                 if (!$id) errorResponse('id is required for stats', 400);
                 successResponse($svc->getChannelStats($id));
+            } elseif (isset($_GET['p8_bounds'])) {
+                if (!$id) errorResponse('id is required', 400);
+                successResponse($svc->part8Bounds($id));
+            } elseif (isset($_GET['p8_anchor'])) {
+                if (!$id) errorResponse('id is required', 400);
+                if (!isset($_GET['pcr'])) errorResponse('pcr is required', 400);
+                successResponse($svc->part8Anchor($id, $_GET['pcr'],
+                                                  (int)($_GET['duration_ms'] ?? 0)));
             } elseif ($id) {
                 $ch = $svc->getChannel($id);
                 if (!$ch) errorResponse("Channel '{$id}' not found", 404);
@@ -57,6 +65,12 @@ try {
                     case 'start':   $ok = $svc->startChannel($id);   break;
                     case 'stop':    $ok = $svc->stopChannel($id);    break;
                     case 'restart': $ok = $svc->restartChannel($id); break;
+                    // Part 8 is controlled separately from Part 7 on purpose:
+                    // stopping one must never stop the other while both serve
+                    // boxes in the field.
+                    case 'p8start':   $ok = $svc->startPart8($id);   break;
+                    case 'p8stop':    $ok = $svc->stopPart8($id);    break;
+                    case 'p8restart': $ok = $svc->restartPart8($id); break;
                     default: errorResponse("Unknown action '{$action}'", 400);
                 }
                 if (!$ok) errorResponse("Failed to {$action} channel '{$id}' - see journalctl", 500);

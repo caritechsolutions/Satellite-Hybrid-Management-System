@@ -193,6 +193,26 @@ require_once __DIR__ . '/config/config.php';
       <div id="anzTable"></div>
     </div>
 
+    <div class="anz">
+      <h3>Part 8 recovery <span class="hint">(out-of-band, PCR-aligned)</span></h3>
+      <div class="hint">
+        A second recovery peer for this channel, <em>alongside</em> Part 7 rather
+        than instead of it. Part 7 boxes in the field keep using the marker path
+        and are not touched by this.
+      </div>
+      <label class="chk" style="margin-top:8px">
+        <input type="checkbox" id="f_part8">
+        Run the Part 8 per-channel recovery sender
+      </label>
+      <div class="hint" style="margin-top:6px">
+        The filter PID set, the PCR PID and the ports are all derived from the
+        analysis &mdash; there is nothing here to type. Needs an analysis, and no
+        PID remap or service rename: either would make the box filter different
+        PID numbers than the headend sends.
+      </div>
+      <div id="p8Derived" class="hint mono" style="margin-top:8px"></div>
+    </div>
+
     <div class="row">
       <button class="primary" id="saveBtn" onclick="save()">Create channel</button>
       <button class="ghost" id="cancelBtn" onclick="resetForm()" style="display:none">Cancel</button>
@@ -205,10 +225,10 @@ require_once __DIR__ . '/config/config.php';
       <thead>
         <tr>
           <th>Name</th><th>Service ID</th><th>Input</th><th>Uplink</th><th>Marker PID</th><th>Buffer</th>
-          <th>Ports (sat / rec / metrics)</th><th>Sender</th><th>Marker</th><th></th>
+          <th>Ports (sat / rec / metrics)</th><th>Sender</th><th>Marker</th><th>Part 8</th><th></th>
         </tr>
       </thead>
-      <tbody id="rows"><tr><td colspan="10" class="empty">Loading&hellip;</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="11" class="empty">Loading&hellip;</td></tr></tbody>
     </table>
   </div>
 </main>
@@ -258,7 +278,7 @@ async function load() {
     const rows = document.getElementById('rows');
 
     if (!d.channels.length) {
-      rows.innerHTML = '<tr><td colspan="10" class="empty">No channels yet - add one above</td></tr>';
+      rows.innerHTML = '<tr><td colspan="11" class="empty">No channels yet - add one above</td></tr>';
       return;
     }
 
@@ -274,22 +294,32 @@ async function load() {
         <td>${pill(c.status)}</td>
         <td>${pill(c.marker_status)}</td>
         <td style="white-space:nowrap">
+          ${c.part8
+            ? pill(c.part8_status) + ` <span class="hint mono">:${c.p8_port || '?'}</span>`
+            : '<span class="hint">off</span>'}
+        </td>
+        <td style="white-space:nowrap">
           ${c.status === 'active'
             ? `<button class="mini stop" onclick="ctl('${c.id}','stop')">Stop</button>`
             : `<button class="mini start" onclick="ctl('${c.id}','start')">Start</button>`}
+          ${c.part8
+            ? (c.part8_status === 'active'
+                ? `<button class="mini stop" onclick="ctl('${c.id}','p8stop')">P8 stop</button>`
+                : `<button class="mini start" onclick="ctl('${c.id}','p8start')">P8 start</button>`)
+            : ''}
           <button class="mini ghost" onclick="toggleStats('${c.id}')">${openStats.has(c.id) ? 'Hide' : 'Stats'}</button>
           <button class="mini ghost" onclick='edit(${JSON.stringify(c)})'>Edit</button>
           <button class="mini del" onclick="del('${c.id}','${esc(c.name)}')">Delete</button>
         </td>
       </tr>
-      ${openStats.has(c.id) ? `<tr class="statrow" id="st-${c.id}"><td colspan="10">
+      ${openStats.has(c.id) ? `<tr class="statrow" id="st-${c.id}"><td colspan="11">
            <div class="statwrap" id="sw-${c.id}">Loading stats&hellip;</div></td></tr>` : ''}`).join('');
 
     openStats.forEach(id => loadStats(id));
   } catch (e) {
     toast(e.message, false);
     document.getElementById('rows').innerHTML =
-      `<tr><td colspan="10" class="empty">${esc(e.message)}</td></tr>`;
+      `<tr><td colspan="11" class="empty">${esc(e.message)}</td></tr>`;
   }
 }
 
@@ -385,6 +415,7 @@ async function save() {
     declare_marker: document.getElementById('f_declare').checked,
     out_service_id: document.getElementById('f_outsvc').value,
     remap:      remap,
+    part8:      document.getElementById('f_part8').checked,
   };
   try {
     if (editing) {
@@ -423,9 +454,40 @@ function edit(c) {
   document.getElementById('f_sat').value    = c.sat_port;
   document.getElementById('f_rec').value    = c.recovery_port;
   document.getElementById('f_met').value    = c.metrics_port;
+  document.getElementById('f_part8').checked = !!c.part8;
+  renderP8(c);
   document.getElementById('saveBtn').textContent = 'Save changes';
   document.getElementById('cancelBtn').style.display = '';
   window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// What Part 8 derived for this channel, as the SERVER computed it. Deliberately
+// not recomputed here: a second copy of the PID rule in JavaScript would be one
+// more place for the two ends to disagree, which is the failure this whole
+// feature exists to prevent.
+function renderP8(c) {
+  const el = document.getElementById('p8Derived');
+  if (!c || !c.part8) {
+    el.innerHTML = c && c.analysis && c.analysis.pcr_pid
+      ? `PCR PID from the analysis: ${c.analysis.pcr_pid} `
+        + `(0x${(+c.analysis.pcr_pid).toString(16).toUpperCase()}). `
+        + `The filter PID set is computed when you save.`
+      : 'Analyse the input to see what Part 8 would filter.';
+    return;
+  }
+  if (c.part8_filter_error) {
+    el.innerHTML = `<span style="color:#c33">${esc(c.part8_filter_error)}</span>`;
+    return;
+  }
+  const pids = c.part8_filter_pids || [];
+  el.innerHTML =
+    `sender&nbsp;&nbsp;&nbsp;part8-recovery@${esc(c.id)} on port ${c.p8_port || '?'} `
+      + `(${esc(c.part8_status || 'unknown')})<br>`
+    + `filter&nbsp;&nbsp;&nbsp;ristsender-${esc(c.id)}-p8src &rarr; `
+      + `238.0.0.x:${c.p8_tsp_port || '?'}<br>`
+    + `pcr_cut&nbsp;&nbsp;${c.analysis && c.analysis.pcr_pid ? c.analysis.pcr_pid : '?'}<br>`
+    + `pids&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${pids.length} &mdash; `
+      + pids.map(p => '0x' + p.toString(16).toUpperCase().padStart(4, '0')).join(' ');
 }
 
 function resetForm() {
@@ -435,6 +497,8 @@ function resetForm() {
   document.getElementById('f_buf').value = '8000';
   document.getElementById('f_declare').checked = false;
   document.getElementById('f_outsvc').value = '';
+  document.getElementById('f_part8').checked = false;
+  document.getElementById('p8Derived').innerHTML = '';
   remap = {}; analysis = null;
   document.getElementById('anzTable').innerHTML = '';
   document.getElementById('anzNote').textContent = '';

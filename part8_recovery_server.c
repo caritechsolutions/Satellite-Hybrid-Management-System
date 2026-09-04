@@ -320,6 +320,50 @@ static uint64_t pcr_abs_diff(uint64_t a, uint64_t b)
  *   AFC == 3 (adaptation+payload) -> length <= 182, else it overruns
  *   a PCR needs the flags byte plus 6 PCR bytes -> length >= 7
  */
+
+/* --------------------------------------------------- PCR-boundary framing */
+/*
+ * -C <pcr_pid>. OFF unless given, and while it is off nothing below runs: the
+ * packetiser stays the fixed 7-per-payload it has always been.
+ *
+ * With it on, a payload starts at every PCR-bearing packet of this PID and then
+ * fills greedily to 7. The box's librist cutter (librist/src/pcr_cut.c) applies
+ * exactly the same rule to the same packet list, so both sides split identically
+ * and a sequence number names the same interval on both ends.
+ *
+ * DELIBERATELY LOOSER THAN ts_extract_pcr(). The two predicates are not the same
+ * and must not be merged:
+ *
+ *   - This one decides WHERE TO CUT, so it has to agree bit for bit with the
+ *     box's cutter -- and the box's cutter is this rule. Were the server
+ *     stricter, a malformed PCR would be a boundary on the box and not here, and
+ *     every payload after it would be misaligned.
+ *   - ts_extract_pcr() decides WHAT TO INDEX, where a plausible-looking PCR out
+ *     of a corrupt packet would poison the catalogue. Strictness is right there.
+ *
+ * ts_extract_pcr()'s conditions are a strict superset of these, so every
+ * catalogue entry is also a cut boundary -- which is what makes the anchor's
+ * "the PCR sits at offset 0 of start_ext" true. The reverse does not hold: a
+ * malformed PCR cuts without being indexed, which is the outcome we want.
+ */
+static uint16_t g_pcr_cut_pid     = 0;    /* 0 = disabled */
+static bool     g_pcr_seen_first  = false;
+static uint64_t g_pcr_cuts        = 0;
+static uint64_t g_pcr_dropped_pre = 0;
+
+static bool pcr_cut_boundary(const uint8_t *p)
+{
+	uint8_t afc;
+	if ((uint16_t)(((p[1] & 0x1F) << 8) | p[2]) != g_pcr_cut_pid)
+		return false;
+	afc = (uint8_t)((p[3] >> 4) & 0x03);
+	if (afc != 2 && afc != 3)
+		return false;
+	if (p[4] == 0)                        /* adaptation_field_length */
+		return false;
+	return (p[5] & 0x10) != 0;            /* PCR_flag */
+}
+
 /*
  * Adaptation-field discontinuity_indicator on ANY packet, PCR-bearing or not.
  *
@@ -1392,11 +1436,13 @@ static void debug_handle(int fd, const char *line)
 			" queue_now=%" PRIu64 " queue_max=%" PRIu64 " queue_ms=%" PRIu64
 			" queue_bytes=%" PRIu64 " ceiling=%llu outside_buffer=%" PRIu64
 			" disc_total=%" PRIu64 " disc_nopcr=%" PRIu64
+			" pcr_cut_pid=%u pcr_cuts=%" PRIu64 " pcr_dropped_pre=%" PRIu64
 			" tripwires=%c%c\n",
 			g_ext_seq, g_payloads_written, g_ts_packets_in,
 			g_queue_size_now, g_queue_size_max, g_queue_time_ms, g_queue_bytesize,
 			(unsigned long long)SEQ_SPACE, g_requests_outside_buffer,
 			g_disc_total, g_disc_indicator_nopcr,
+			g_pcr_cut_pid, g_pcr_cuts, g_pcr_dropped_pre,
 			g_tripwire_a_fired ? 'A' : '-', g_tripwire_b_fired ? 'B' : '-');
 		pthread_mutex_lock(&catalogue_lock);
 		for (int pid = 0; pid < MAX_PIDS; pid++) {
@@ -1693,14 +1739,14 @@ static int open_input(const char *host, int port, int want_rcvbuf)
  * query time would mean re-parsing the retransmit buffer, which is both slower
  * and unable to see payloads that have already aged out.
  */
-static void emit_payload(uint8_t *stage)
+static void emit_payload(uint8_t *stage, size_t n_pkts)
 {
 	uint64_t ext = g_ext_seq;
 
 	/* Test every packet rather than consulting PAT/PMT. The request names the
 	 * PCR_PID explicitly, so we only ever look up what we are asked for, and an
 	 * index built from observation cannot go stale when a PMT changes. */
-	for (int s = 0; s < TS_PER_RTP; s++) {
+	for (int s = 0; s < (int)n_pkts; s++) {
 		const uint8_t *p = stage + s * TS_PACKET_SIZE;
 		uint16_t pid; uint64_t base; bool disc;
 		if (ts_extract_pcr(p, &pid, &base, &disc)) {
@@ -1729,7 +1775,7 @@ static void emit_payload(uint8_t *stage)
 	struct rist_data_block db;
 	memset(&db, 0, sizeof(db));
 	db.payload     = stage;
-	db.payload_len = RTP_PAYLOAD_SIZE;
+	db.payload_len = n_pkts * TS_PACKET_SIZE;   /* == RTP_PAYLOAD_SIZE without -C */
 	db.seq         = (uint32_t)(ext & 0xFFFF);   /* librist masks to 16 bits anyway */
 	db.flags       = RIST_DATA_FLAGS_USE_SEQ;    /* we own the sequence space */
 
@@ -1747,6 +1793,37 @@ static void emit_payload(uint8_t *stage)
 	g_payloads_written++;
 }
 
+/*
+ * One staging site for both branches of the reader loop, so the cut rule cannot
+ * end up applied in one and not the other.
+ *
+ * With -C off this is exactly what both call sites did inline: append, and emit
+ * on the 7th packet.
+ */
+static size_t stage_packet(uint8_t *stage, size_t staged, const uint8_t *p)
+{
+	if (g_pcr_cut_pid) {
+		if (pcr_cut_boundary(p)) {
+			/* Flush BEFORE appending, so the PCR packet is always offset 0 of
+			 * the payload it starts and the greedy-7 count restarts there. An
+			 * empty pending buffer (two adjacent PCRs) emits nothing and does
+			 * not advance the sequence. */
+			if (staged) { emit_payload(stage, staged); staged = 0; }
+			g_pcr_seen_first = true;
+			g_pcr_cuts++;
+		} else if (!g_pcr_seen_first) {
+			/* Bytes before the first PCR belong to an interval whose start we
+			 * never saw. The box discards them for the same reason. */
+			g_pcr_dropped_pre++;
+			return staged;
+		}
+	}
+
+	memcpy(stage + staged * TS_PACKET_SIZE, p, TS_PACKET_SIZE);
+	if (++staged == TS_PER_RTP) { emit_payload(stage, staged); staged = 0; }
+	return staged;
+}
+
 /* -------------------------------------------------------------------- main */
 static void usage(const char *me)
 {
@@ -1762,6 +1839,8 @@ static void usage(const char *me)
 		"  -g GROUP     chown the debug socket to GROUP and set 0660, so a UI\n"
 		"               running as that group can connect (connect needs write)\n"
 		"  -S           do NOT require a registered content selection (unsafe)\n"
+		"  -C PID       cut payloads at every PCR of PID (Part 8 per-channel\n"
+		"               sender). Omit for the fixed 7-packet packetisation.\n"
 		"  -v           verbose\n", me, DEFAULT_BUFFER_MS, DEFAULT_RCVBUF, DEFAULT_DEBUG_SOCK);
 }
 
@@ -1773,7 +1852,7 @@ int main(int argc, char *argv[])
 	bool saw_npd = false;
 	int c;
 
-	while ((c = getopt(argc, argv, "i:o:b:r:d:N:g:Snvh")) != -1) {
+	while ((c = getopt(argc, argv, "i:o:b:r:d:N:g:C:Snvh")) != -1) {
 		switch (c) {
 		case 'i': inurl  = strdup(optarg); break;
 		case 'o': outurl = strdup(optarg); break;
@@ -1783,6 +1862,19 @@ int main(int argc, char *argv[])
 		case 'N': snprintf(g_instance_name, sizeof(g_instance_name), "%s", optarg); break;
 		case 'g': snprintf(g_sock_group, sizeof(g_sock_group), "%s", optarg); break;
 		case 'S': require_selection = false; break;
+		case 'C': {
+			/* A real PID, so 1..0x1FFE. Anything else is refused rather than
+			 * silently ignored: a typo here would run the fixed packetiser
+			 * against a box that is cutting at PCRs, and every payload would
+			 * be misaligned with nothing in the log to say why. */
+			long v = strtol(optarg, NULL, 0);
+			if (v <= 0 || v >= 0x1FFF) {
+				fprintf(stderr, "FATAL: -C wants a PID in 1..8190, got '%s'\n", optarg);
+				return 1;
+			}
+			g_pcr_cut_pid = (uint16_t)v;
+			break;
+		}
 		case 'n': saw_npd = true; break;
 		case 'v': logging_settings.log_level = RIST_LOG_DEBUG; break;
 		default:  usage(argv[0]); return 1;
@@ -1886,6 +1978,14 @@ int main(int argc, char *argv[])
 	rist_log(&logging_settings, RIST_LOG_INFO,
 		"[START] Part 8 recovery server: in=%s out=%s buffer=%d ms ceiling=%llu payloads\n",
 		inurl, outurl, g_buffer_ms, (unsigned long long)SEQ_SPACE);
+	if (g_pcr_cut_pid)
+		rist_log(&logging_settings, RIST_LOG_INFO,
+			"[START] PCR-boundary framing ON, pcr_pid=0x%04X (%u). The box must "
+			"cut on the same PID or the sequence means nothing to it.\n",
+			g_pcr_cut_pid, g_pcr_cut_pid);
+	else
+		rist_log(&logging_settings, RIST_LOG_INFO,
+			"[START] fixed %d-packet payloads (no -C)\n", TS_PER_RTP);
 
 	g_start_us = now_us();
 	uint64_t next_log = g_start_us + 5000000ULL;
@@ -1929,8 +2029,7 @@ int main(int argc, char *argv[])
 				if (partial_len < TS_PACKET_SIZE) break;
 				partial_len = 0;
 				if (partial[0] != TS_SYNC) { g_sync_errors++; continue; }
-				memcpy(stage + staged * TS_PACKET_SIZE, partial, TS_PACKET_SIZE);
-				if (++staged == TS_PER_RTP) { emit_payload(stage); staged = 0; }
+				staged = stage_packet(stage, staged, partial);
 				g_ts_packets_in++;
 				continue;
 			}
@@ -1942,8 +2041,7 @@ int main(int argc, char *argv[])
 			uint8_t *p = rx + off;
 			off += TS_PACKET_SIZE;
 			if (p[0] != TS_SYNC) { g_sync_errors++; continue; }
-			memcpy(stage + staged * TS_PACKET_SIZE, p, TS_PACKET_SIZE);
-			if (++staged == TS_PER_RTP) { emit_payload(stage); staged = 0; }
+			staged = stage_packet(stage, staged, p);
 			g_ts_packets_in++;
 		}
 

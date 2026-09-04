@@ -142,7 +142,31 @@ try {
     if ($method === 'GET' && isset($_GET['service_id'])) {
         $want = (int)$_GET['service_id'];
         foreach ($channels as $ch) {
-            if ($ch['service_id'] === $want) emit($ch);
+            if ($ch['service_id'] !== $want) continue;
+
+            // THE ANCHOR (B3). ?pcr=<33-bit PCR base> asks which RTP sequence
+            // carries it, answered from the sender's own PCR -> sequence
+            // catalogue -- the same index the retransmit path serves from, so
+            // it cannot disagree with what a NACK would return.
+            //
+            // It rides the GET the box already makes at zap: no second
+            // connection, no new protocol, and no query load on the sender's
+            // protocol thread, which services every peer's event loop while
+            // holding peerlist_lock.
+            if (isset($_GET['pcr']) && !empty($ch['part8'])) {
+                $id = $svc->channelIdForService($want);
+                if ($id !== null) {
+                    try {
+                        $ch['anchor'] = $svc->part8Anchor(
+                            $id, $_GET['pcr'], (int)($_GET['duration_ms'] ?? 0));
+                    } catch (Exception $e) {
+                        // A failed anchor must not cost the box its record.
+                        $ch['anchor'] = ['status' => 'UNAVAILABLE',
+                                         'note'   => $e->getMessage()];
+                    }
+                }
+            }
+            emit($ch);
         }
         emit(['error' => true,
               'message' => "No RIST recovery for service_id {$want}"], 404);

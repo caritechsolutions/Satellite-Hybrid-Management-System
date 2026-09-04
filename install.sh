@@ -573,7 +573,9 @@ say "Isolation check: what changed in unit state"
 if diff -u "$P8_STATE_BEFORE" "$P8_STATE_AFTER" > /tmp/part8-units-diff.txt 2>&1; then
     info "NOTHING changed at all"
 else
-    _changed="$(grep -E '^[+-][^+-]' /tmp/part8-units-diff.txt | grep -v 'part8' || true)"
+    # Same classification as part8-unit's report_diff(): a -p8src unit is Part 8
+    # wearing a rist* name, because rist-unit accepts no other kind.
+    _changed="$(grep -E '^[+-][^+-]' /tmp/part8-units-diff.txt | grep -vE 'part8|-p8src' || true)"
     _rist="$(printf '%s\n' "$_changed" | grep -E 'rist' || true)"
     _other="$(printf '%s\n' "$_changed" | grep -vE 'rist' | grep -v '^$' || true)"
     if [ -n "$_rist" ]; then
@@ -586,6 +588,6 @@ else
         info "other units that moved during the install (informational):"
         printf '%s\n' "$_other" | head -12 | sed 's/^/        /'
     fi
-    { grep -E '^\+[^+]' /tmp/part8-units-diff.txt | grep 'part8' || true; } | sed 's/^/        added: /'
+    { grep -E '^\+[^+]' /tmp/part8-units-diff.txt | grep -E 'part8|-p8src' || true; } | sed 's/^/        added: /'
     info "full diff: /tmp/part8-units-diff.txt"
 fi

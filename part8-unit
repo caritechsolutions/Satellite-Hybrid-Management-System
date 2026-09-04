@@ -64,7 +64,15 @@ snapshot() {
 report_diff() {
     local before="$1" after="$2"
     local changed rist other
-    changed="$(diff "$before" "$after" 2>/dev/null | grep -E '^[<>]' | grep -v 'part8' || true)"
+    # '-p8src' is a Part 8 unit that has to live under a rist* name: it is
+    # installed by rist-unit, which accepts only ristsender-*/ristmarker-*, so
+    # every name it can be given contains 'rist'. It is BindsTo the Part 8
+    # instance, so starting Part 8 starts it every time -- and without this it
+    # would report PART7-CHANGED on every single Part 8 action, which is exactly
+    # the cry-wolf this function's own comment warns about. Classification only:
+    # nothing here changes what any unit does.
+    changed="$(diff "$before" "$after" 2>/dev/null | grep -E '^[<>]' \
+               | grep -vE 'part8|-p8src' || true)"
     if [ -z "$changed" ]; then
         echo "PART7-UNCHANGED"
         return
