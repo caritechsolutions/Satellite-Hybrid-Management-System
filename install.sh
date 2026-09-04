@@ -25,7 +25,7 @@ PORT="${PORT:-80}"
 # reset --hard on a re-run, but it is listed explicitly anyway: the fresh-install
 # path does rm -rf on APP_DIR, and relying on "untracked files happen to
 # survive" is the kind of assumption that holds until someone adds a git clean.
-STATE_FILES="rist-monitor/config/transports.json rist-monitor/config/channels.json rist-monitor/config/satellites.json rist-monitor/data/receivers.json part8-monitor/config/instances.json"
+STATE_FILES="rist-monitor/config/transports.json rist-monitor/config/channels.json rist-monitor/config/part8-channels.json rist-monitor/config/satellites.json rist-monitor/data/receivers.json part8-monitor/config/instances.json"
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }

@@ -193,26 +193,6 @@ require_once __DIR__ . '/config/config.php';
       <div id="anzTable"></div>
     </div>
 
-    <div class="anz">
-      <h3>Part 8 recovery <span class="hint">(out-of-band, PCR-aligned)</span></h3>
-      <div class="hint">
-        A second recovery peer for this channel, <em>alongside</em> Part 7 rather
-        than instead of it. Part 7 boxes in the field keep using the marker path
-        and are not touched by this.
-      </div>
-      <label class="chk" style="margin-top:8px">
-        <input type="checkbox" id="f_part8">
-        Run the Part 8 per-channel recovery sender
-      </label>
-      <div class="hint" style="margin-top:6px">
-        The filter PID set, the PCR PID and the ports are all derived from the
-        analysis &mdash; there is nothing here to type. Needs an analysis, and no
-        PID remap or service rename: either would make the box filter different
-        PID numbers than the headend sends.
-      </div>
-      <div id="p8Derived" class="hint mono" style="margin-top:8px"></div>
-    </div>
-
     <div class="row">
       <button class="primary" id="saveBtn" onclick="save()">Create channel</button>
       <button class="ghost" id="cancelBtn" onclick="resetForm()" style="display:none">Cancel</button>
@@ -225,10 +205,63 @@ require_once __DIR__ . '/config/config.php';
       <thead>
         <tr>
           <th>Name</th><th>Service ID</th><th>Input</th><th>Uplink</th><th>Marker PID</th><th>Buffer</th>
-          <th>Ports (sat / rec / metrics)</th><th>Sender</th><th>Marker</th><th>Part 8</th><th></th>
+          <th>Ports (sat / rec / metrics)</th><th>Sender</th><th>Marker</th><th></th>
         </tr>
       </thead>
-      <tbody id="rows"><tr><td colspan="11" class="empty">Loading&hellip;</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="10" class="empty">Loading&hellip;</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2 id="p8FormTitle">Add Part 8 recovery channel</h2>
+    <div class="hint" style="margin-bottom:12px">
+      A Part 8 channel has no marker, no uplink output and no satellite peer
+      &mdash; it is a filter and a recovery sender off the shared transponder
+      ingest, nothing more. Three fields, then Analyse, then Create; the filter
+      PID set, the PCR PID and the ports are all derived.
+    </div>
+    <div class="grid">
+      <div>
+        <label>Channel name</label>
+        <input id="p_name" placeholder="NCN-Guyana">
+        <div class="hint">Becomes the unit name &mdash; a-z, 0-9 and '-'</div>
+      </div>
+      <div>
+        <label>Transponder ingest (UDP)</label>
+        <input id="p_input" class="mono" placeholder="239.5.5.5:5000">
+        <div class="hint">The shared feed. Read, never consumed &mdash; other chains keep using it.</div>
+      </div>
+      <div>
+        <label>Service ID</label>
+        <input id="p_sid" class="mono" placeholder="2">
+        <div class="hint">The service in that ingest, and the id the boxes look up. Part 8 does not remux, so they are the same number.</div>
+      </div>
+    </div>
+
+    <div class="anz">
+      <div class="row" style="margin-top:0">
+        <button class="ghost" id="pAnzBtn" onclick="p8Analyse()">Analyse ingest</button>
+        <span class="hint" id="pAnzNote"></span>
+      </div>
+      <div id="p8Derived" class="hint mono" style="margin-top:10px"></div>
+    </div>
+
+    <div class="row">
+      <button class="primary" id="pSaveBtn" onclick="p8Save()">Create Part 8 channel</button>
+      <button class="ghost" id="pCancelBtn" onclick="p8Reset()" style="display:none">Cancel</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Part 8 recovery channels</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th><th>Service</th><th>Ingest</th><th>Recovery URL</th>
+          <th>PCR PID</th><th>Filter PIDs</th><th>Sender</th><th>Filter</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="p8rows"><tr><td colspan="9" class="empty">Loading&hellip;</td></tr></tbody>
     </table>
   </div>
 </main>
@@ -278,7 +311,7 @@ async function load() {
     const rows = document.getElementById('rows');
 
     if (!d.channels.length) {
-      rows.innerHTML = '<tr><td colspan="11" class="empty">No channels yet - add one above</td></tr>';
+      rows.innerHTML = '<tr><td colspan="10" class="empty">No channels yet - add one above</td></tr>';
       return;
     }
 
@@ -294,32 +327,22 @@ async function load() {
         <td>${pill(c.status)}</td>
         <td>${pill(c.marker_status)}</td>
         <td style="white-space:nowrap">
-          ${c.part8
-            ? pill(c.part8_status) + ` <span class="hint mono">:${c.p8_port || '?'}</span>`
-            : '<span class="hint">off</span>'}
-        </td>
-        <td style="white-space:nowrap">
           ${c.status === 'active'
             ? `<button class="mini stop" onclick="ctl('${c.id}','stop')">Stop</button>`
             : `<button class="mini start" onclick="ctl('${c.id}','start')">Start</button>`}
-          ${c.part8
-            ? (c.part8_status === 'active'
-                ? `<button class="mini stop" onclick="ctl('${c.id}','p8stop')">P8 stop</button>`
-                : `<button class="mini start" onclick="ctl('${c.id}','p8start')">P8 start</button>`)
-            : ''}
           <button class="mini ghost" onclick="toggleStats('${c.id}')">${openStats.has(c.id) ? 'Hide' : 'Stats'}</button>
           <button class="mini ghost" onclick='edit(${JSON.stringify(c)})'>Edit</button>
           <button class="mini del" onclick="del('${c.id}','${esc(c.name)}')">Delete</button>
         </td>
       </tr>
-      ${openStats.has(c.id) ? `<tr class="statrow" id="st-${c.id}"><td colspan="11">
+      ${openStats.has(c.id) ? `<tr class="statrow" id="st-${c.id}"><td colspan="10">
            <div class="statwrap" id="sw-${c.id}">Loading stats&hellip;</div></td></tr>` : ''}`).join('');
 
     openStats.forEach(id => loadStats(id));
   } catch (e) {
     toast(e.message, false);
     document.getElementById('rows').innerHTML =
-      `<tr><td colspan="11" class="empty">${esc(e.message)}</td></tr>`;
+      `<tr><td colspan="10" class="empty">${esc(e.message)}</td></tr>`;
   }
 }
 
@@ -415,7 +438,6 @@ async function save() {
     declare_marker: document.getElementById('f_declare').checked,
     out_service_id: document.getElementById('f_outsvc').value,
     remap:      remap,
-    part8:      document.getElementById('f_part8').checked,
   };
   try {
     if (editing) {
@@ -454,40 +476,9 @@ function edit(c) {
   document.getElementById('f_sat').value    = c.sat_port;
   document.getElementById('f_rec').value    = c.recovery_port;
   document.getElementById('f_met').value    = c.metrics_port;
-  document.getElementById('f_part8').checked = !!c.part8;
-  renderP8(c);
   document.getElementById('saveBtn').textContent = 'Save changes';
   document.getElementById('cancelBtn').style.display = '';
   window.scrollTo({ top: 0, behavior: 'smooth' });
-}
-
-// What Part 8 derived for this channel, as the SERVER computed it. Deliberately
-// not recomputed here: a second copy of the PID rule in JavaScript would be one
-// more place for the two ends to disagree, which is the failure this whole
-// feature exists to prevent.
-function renderP8(c) {
-  const el = document.getElementById('p8Derived');
-  if (!c || !c.part8) {
-    el.innerHTML = c && c.analysis && c.analysis.pcr_pid
-      ? `PCR PID from the analysis: ${c.analysis.pcr_pid} `
-        + `(0x${(+c.analysis.pcr_pid).toString(16).toUpperCase()}). `
-        + `The filter PID set is computed when you save.`
-      : 'Analyse the input to see what Part 8 would filter.';
-    return;
-  }
-  if (c.part8_filter_error) {
-    el.innerHTML = `<span style="color:#c33">${esc(c.part8_filter_error)}</span>`;
-    return;
-  }
-  const pids = c.part8_filter_pids || [];
-  el.innerHTML =
-    `sender&nbsp;&nbsp;&nbsp;part8-recovery@${esc(c.id)} on port ${c.p8_port || '?'} `
-      + `(${esc(c.part8_status || 'unknown')})<br>`
-    + `filter&nbsp;&nbsp;&nbsp;ristsender-${esc(c.id)}-p8src &rarr; `
-      + `238.0.0.x:${c.p8_tsp_port || '?'}<br>`
-    + `pcr_cut&nbsp;&nbsp;${c.analysis && c.analysis.pcr_pid ? c.analysis.pcr_pid : '?'}<br>`
-    + `pids&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${pids.length} &mdash; `
-      + pids.map(p => '0x' + p.toString(16).toUpperCase().padStart(4, '0')).join(' ');
 }
 
 function resetForm() {
@@ -497,8 +488,6 @@ function resetForm() {
   document.getElementById('f_buf').value = '8000';
   document.getElementById('f_declare').checked = false;
   document.getElementById('f_outsvc').value = '';
-  document.getElementById('f_part8').checked = false;
-  document.getElementById('p8Derived').innerHTML = '';
   remap = {}; analysis = null;
   document.getElementById('anzTable').innerHTML = '';
   document.getElementById('anzNote').textContent = '';
@@ -590,8 +579,161 @@ async function loadStats(id) {
   }
 }
 
+// ---------------------------------------------------------------- Part 8
+// A separate store, a separate API and a separate table. Nothing here reads or
+// writes a Part 7 channel, which is what makes "no Part 7 record changed" a
+// property of the code rather than a claim about it.
+const P8API = 'api/part8.php';
+let p8editing = null;
+let p8analysis = null;
+
+async function p8api(method, qs, body) {
+  const r = await fetch(P8API + qs, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.message || ('HTTP ' + r.status));
+  return j.data !== undefined ? j.data : j;
+}
+
+function p8Reset() {
+  p8editing = null; p8analysis = null;
+  ['p_name','p_input','p_sid'].forEach(i => document.getElementById(i).value = '');
+  document.getElementById('p8Derived').innerHTML = '';
+  document.getElementById('pAnzNote').textContent = '';
+  document.getElementById('p8FormTitle').textContent = 'Add Part 8 recovery channel';
+  document.getElementById('pSaveBtn').textContent = 'Create Part 8 channel';
+  document.getElementById('pCancelBtn').style.display = 'none';
+}
+
+function p8Edit(c) {
+  p8editing = c.id;
+  document.getElementById('p_name').value  = c.name;
+  document.getElementById('p_input').value = c.input_url;
+  document.getElementById('p_sid').value   = c.service_id;
+  p8analysis = c.analysis || null;
+  document.getElementById('pAnzNote').textContent =
+    p8analysis ? 'last analysed ' + ago(p8analysis.analysed_at) : 'not analysed yet';
+  p8Derived(c);
+  document.getElementById('p8FormTitle').textContent = 'Edit Part 8 channel';
+  document.getElementById('pSaveBtn').textContent = 'Save changes';
+  document.getElementById('pCancelBtn').style.display = '';
+  window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+}
+
+// What the SERVER derived. Deliberately not recomputed in JavaScript: a second
+// copy of the PID rule would be one more place for the two ends to disagree,
+// which is the failure this whole feature exists to prevent.
+function p8Derived(c) {
+  const el = document.getElementById('p8Derived');
+  if (!c) { el.innerHTML = ''; return; }
+  if (c.filter_error) {
+    el.innerHTML = `<span style="color:#ff6b6b">${esc(c.filter_error)}</span>`;
+    return;
+  }
+  if (!c.analysis) { el.innerHTML = 'Analyse the ingest to derive the filter set.'; return; }
+  const pids = c.filter_pids || [];
+  const pcr  = c.analysis.pcr_pid || 0;
+  el.innerHTML =
+      `sender&nbsp;&nbsp;&nbsp;part8-recovery@${esc(c.id)} &rarr; ${esc(c.rist_url || '')}<br>`
+    + `filter&nbsp;&nbsp;&nbsp;ristsender-${esc(c.id)}-p8src &rarr; ${esc(c.internal || '')}<br>`
+    + `pcr_cut&nbsp;&nbsp;${pcr} (0x${(+pcr).toString(16).toUpperCase().padStart(4,'0')})<br>`
+    + `pids&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${pids.length} &mdash; `
+    + pids.map(p => '0x' + p.toString(16).toUpperCase().padStart(4,'0')).join(' ');
+}
+
+async function p8Analyse() {
+  if (!p8editing) { toast('Create the channel first, then analyse its ingest', false); return; }
+  const btn = document.getElementById('pAnzBtn');
+  btn.disabled = true; btn.textContent = 'Analysing\u2026';
+  try {
+    p8analysis = await p8api('GET', '?analyse=1&id=' + encodeURIComponent(p8editing));
+    toast('Analysed');
+    const c = await p8api('GET', '?id=' + encodeURIComponent(p8editing));
+    p8Derived(c);
+    document.getElementById('pAnzNote').textContent = 'last analysed just now';
+    p8Load();
+  } catch (e) { toast(e.message, false); }
+  finally { btn.disabled = false; btn.textContent = 'Analyse ingest'; }
+}
+
+async function p8Save() {
+  const payload = {
+    name:       document.getElementById('p_name').value,
+    input_url:  document.getElementById('p_input').value,
+    service_id: document.getElementById('p_sid').value,
+  };
+  try {
+    if (p8editing) {
+      await p8api('PUT', '?id=' + encodeURIComponent(p8editing), payload);
+      toast('Part 8 channel updated');
+    } else {
+      const c = await p8api('POST', '', payload);
+      toast('Created - now Analyse the ingest, then Start');
+      p8Edit(c);
+      p8Load();
+      return;
+    }
+    p8Reset(); p8Load();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function p8Ctl(id, action) {
+  try { await p8api('POST', '?action=' + action + '&id=' + encodeURIComponent(id)); toast(action + ' ok'); }
+  catch (e) { toast(e.message, false); }
+  p8Load();
+}
+
+async function p8Del(id, name) {
+  if (!confirm(`Delete Part 8 channel "${name}"? Its two units are stopped and removed.`)) return;
+  try { await p8api('DELETE', '?id=' + encodeURIComponent(id)); toast('Deleted'); }
+  catch (e) { toast(e.message, false); }
+  p8Reset(); p8Load();
+}
+
+async function p8Load() {
+  const rows = document.getElementById('p8rows');
+  try {
+    const d = await p8api('GET', '');
+    if (!d.channels.length) {
+      rows.innerHTML = '<tr><td colspan="9" class="empty">No Part 8 channels yet</td></tr>';
+      return;
+    }
+    rows.innerHTML = d.channels.map(c => {
+      const pcr = (c.analysis && c.analysis.pcr_pid) || 0;
+      return `
+      <tr>
+        <td><b>${esc(c.name)}</b><div class="hint mono">${esc(c.id)}</div></td>
+        <td class="mono">${c.service_id}</td>
+        <td class="mono">${esc(c.input_url)}</td>
+        <td class="mono">${esc(c.rist_url || '-')}</td>
+        <td class="mono">${pcr ? pcr + ' <span class="hint">0x' + (+pcr).toString(16).toUpperCase() + '</span>'
+                               : '<span class="hint">analyse</span>'}</td>
+        <td class="mono">${c.filter_error ? '<span class="bad">refused</span>'
+                                          : (c.filter_pids ? c.filter_pids.length : '-')}</td>
+        <td>${pill(c.status)}</td>
+        <td>${pill(c.tsp_status)}</td>
+        <td style="white-space:nowrap">
+          ${c.status === 'active'
+            ? `<button class="mini stop" onclick="p8Ctl('${c.id}','stop')">Stop</button>`
+            : `<button class="mini start" onclick="p8Ctl('${c.id}','start')">Start</button>`}
+          <button class="mini ghost" onclick='p8Edit(${JSON.stringify(c)})'>Edit</button>
+          <button class="mini del" onclick="p8Del('${c.id}','${esc(c.name)}')">Delete</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    rows.innerHTML = `<tr><td colspan="9" class="empty">${esc(e.message)}</td></tr>`;
+  }
+}
+
+
 load();
+p8Load();
 setInterval(load, 10000);
+setInterval(p8Load, 10000);
 </script>
 </body>
 </html>

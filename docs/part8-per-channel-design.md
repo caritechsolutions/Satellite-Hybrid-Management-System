@@ -1,5 +1,11 @@
 # Part 8 per-channel recovery sender + GUI — design
 
+> **Superseded in part by `part8-standalone-channels.md`.** B1's unit shape,
+> B3's anchor and B4's API fields are as built here. B2's GUI is not: Part 8 was
+> a checkbox on the Part 7 form, and is now its own channel type with its own
+> store and its own section. Read that document for the data model and the form;
+> this one for why the sender, the units and the anchor are what they are.
+
 Scope B1–B4 before the build. Two answers differ from the brief, both because
 something already exists that the brief assumed had to be written.
 

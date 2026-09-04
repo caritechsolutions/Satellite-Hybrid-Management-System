@@ -12,6 +12,7 @@
 
 require_once dirname(__DIR__) . '/config/config.php';
 require_once dirname(__DIR__) . '/services/channel-service.php';
+require_once dirname(__DIR__) . '/services/part8-service.php';
 
 if (!defined('STATS_DIR'))  define('STATS_DIR',  DATA_DIR . '/stats');
 if (!defined('STATS_LOG'))  define('STATS_LOG',  STATS_DIR . '/views.jsonl');
@@ -135,7 +136,32 @@ if ($method !== 'GET' && $method !== 'POST') {
 
 try {
     $svc      = new ChannelService();
+    $p8       = new Part8Service();
+
+    // Two independent lists. Part 7 channels and Part 8 channels are separate
+    // records that do not reference each other; the API advertises whatever
+    // exists. A service with both gets ONE record carrying both sets of keys,
+    // so the box still does a single lookup: a Part 7 box finds rist_url and
+    // ignores what it does not know, a Part 8 box finds part8_rist_url.
     $channels = $svc->getRecoveryChannels();
+    $byService = [];
+    foreach ($channels as $i => $c) $byService[(int)$c['service_id']] = $i;
+
+    foreach ($p8->getRecoveryChannels() as $rec) {
+        $sid = (int)$rec['service_id'];
+        if (isset($byService[$sid])) {
+            // Merge INTO the Part 7 record, never over it: name and ts_id are
+            // whatever Part 7 already advertised, because that is what boxes in
+            // the field have been seeing.
+            foreach ($rec as $k => $v) {
+                if ($k === 'name' || $k === 'ts_id' || $k === 'service_id') continue;
+                $channels[$byService[$sid]][$k] = $v;
+            }
+        } else {
+            $byService[$sid] = count($channels);
+            $channels[] = $rec;
+        }
+    }
 
     // Single-service lookup (GET only) - 404 tells the box to stay on the
     // normal decode path for that service.
@@ -154,11 +180,11 @@ try {
             // protocol thread, which services every peer's event loop while
             // holding peerlist_lock.
             if (isset($_GET['pcr']) && !empty($ch['part8'])) {
-                $id = $svc->channelIdForService($want);
-                if ($id !== null) {
+                $p8id = $p8->channelIdForService($want);
+                if ($p8id !== null) {
                     try {
-                        $ch['anchor'] = $svc->part8Anchor(
-                            $id, $_GET['pcr'], (int)($_GET['duration_ms'] ?? 0));
+                        $ch['anchor'] = $p8->anchor(
+                            $p8id, $_GET['pcr'], (int)($_GET['duration_ms'] ?? 0));
                     } catch (Exception $e) {
                         // A failed anchor must not cost the box its record.
                         $ch['anchor'] = ['status' => 'UNAVAILABLE',

@@ -1,80 +1,76 @@
-# Bringing one channel up on Part 8 — NCN-Guyana, end to end
+# Bringing NCN-Guyana up on Part 8 — end to end
 
-Service 0x0002, PMT 0x008E, PCR/video 0x0022, audio 0x0023. All-clear FTA, no
-remap, no service rename — which is what makes it eligible.
+Service 2, PMT 0x008E, PCR/video 0x0022, audio 0x0023. All-clear FTA.
 
-Nothing here stops or restarts a Part 7 unit. The channel keeps serving Part 7
-boxes throughout.
+A Part 8 channel is its own record. **There are no Part 7 fields anywhere in
+this procedure** — no marker PID, no uplink output, no satellite peer port, no
+"declare marker in the PMT". Nothing here stops, restarts or rewrites a Part 7
+unit or a Part 7 channel record.
 
 ---
 
 ## 0. Install
 
-One command on the headend, as always:
-
 ```sh
 curl -fsSL "https://raw.githubusercontent.com/caritechsolutions/Satellite-Hybrid-Management-System/main/install.sh?$(date +%s)" | sudo bash
 ```
 
-Watch two things in the output:
+Two lines to watch:
 
 ```
 ==> Checking librist against riststb
-    librist matches riststb <sha>          <- the sync check; it must not warn
+    librist matches riststb <sha>          <- must not warn
 ==> Isolation check: what changed in unit state
     no rist* unit changed state, enablement or main PID
 ```
 
-The install rebuilds `part8_recovery_server` with `-C`. **Deployed
-`part8-recovery@` instances keep running the old binary until they are
-restarted**, and they have no `-C` in their env files, so restarting them is
-also a no-op behaviourally. Nothing needs restarting for this.
+The install rebuilds `part8_recovery_server` with `-C`. Deployed
+`part8-recovery@` instances keep running the old binary until restarted, and
+their env files carry no `-C`, so restarting them is a no-op either way.
+Nothing needs restarting for this.
 
 ---
 
-## 1. Analyse the input
+## 1. Create the channel — three fields
 
-Channels page → NCN-Guyana → **Edit** → **Analyse input**.
+Channels page → scroll to **Add Part 8 recovery channel**:
 
-This is what the whole feature is derived from, so check it before going on:
+| field | value |
+|---|---|
+| Channel name | `NCN-Guyana` |
+| Transponder ingest (UDP) | the shared feed, e.g. `239.5.5.5:5000` |
+| Service ID | `2` |
 
-```
-service_id 2   pmt_pid 142 (0x008E)   pcr_pid 34 (0x0022)
-```
+**Create Part 8 channel.**
 
-If the report lists more than one service and does not say which service each
-PID belongs to, saving with Part 8 on will refuse and tell you so. That refusal
-is correct — feed the channel a single-service ingest rather than working around
-it.
+The ingest is read, never consumed — the Part 7 chains on the same group keep
+working. Creating allocates a listen port in 9800–9899 and an internal port
+from 6400, and writes nothing but `config/part8-channels.json`.
 
----
+## 2. Analyse the ingest
 
-## 2. Turn Part 8 on
+The form stays open on the new channel. **Analyse ingest.**
 
-Same edit form, **Part 8 recovery** section → tick **Run the Part 8 per-channel
-recovery sender** → **Save changes**.
-
-The panel then shows exactly what was derived. For NCN it should read:
+The derived panel then reads:
 
 ```
-sender    part8-recovery@ncn-guyana on port 9800 (inactive)
+sender    part8-recovery@ncn-guyana -> rist://<recovery-ip>:9800?buffer=8000
 filter    ristsender-ncn-guyana-p8src -> 238.0.0.128:6400
-pcr_cut   34
+pcr_cut   34 (0x0022)
 pids      10 - 0x0000 0x0001 0x0010 0x0011 0x0012 0x0013 0x0014 0x0022 0x0023 0x008E
 ```
 
-If it refuses, it will say why. The three refusals are: no analysis, a PID
-remap, a service rename. All three mean the box would filter different PID
-numbers than the headend sends.
+That is the whole configuration and none of it was typed. If it refuses, it
+says why — the two it can say are "Analyse the input first" and, on an ingest
+whose report lists several services without saying which PIDs belong to which,
+that the elementary streams cannot be identified. The second is correct: feed it
+a single-service ingest rather than working around it.
 
----
+## 3. Start
 
-## 3. Start it
-
-**P8 start** in the channel row. That starts `part8-recovery@ncn-guyana`, and
-the tsp filter stage follows it (`BindsTo`), so one button brings the chain up.
-
-Confirm from the shell:
+**Start** in the **Part 8 recovery channels** row. That writes the two units and
+starts `part8-recovery@ncn-guyana`; the tsp filter follows it (`BindsTo`), so
+one button brings the chain up.
 
 ```sh
 systemctl is-active part8-recovery@ncn-guyana ristsender-ncn-guyana-p8src
@@ -89,24 +85,15 @@ will not:
 [START] PCR-boundary framing ON, pcr_pid=0x0022 (34).
 ```
 
-And that the filter is producing:
-
-```sh
-part8-observe --socket /run/part8-recovery/ncn-guyana/debug.sock \
-              --unit part8-recovery@ncn-guyana --interval 30 &
-```
-
-or once, by hand:
+Then confirm it is producing:
 
 ```sh
 echo stats | socat - UNIX-CONNECT:/run/part8-recovery/ncn-guyana/debug.sock
 ```
 
 `ts_in` climbing and `pcr_cuts` climbing at roughly the PCR rate means the chain
-is alive. `pcr_cuts` stuck at 0 with `ts_in` climbing means the filter is passing
+is alive. `pcr_cuts` stuck at 0 while `ts_in` climbs means the filter is passing
 packets but none carry a PCR on 34 — check the PID list.
-
----
 
 ## 4. Check what the box will be told
 
@@ -114,14 +101,14 @@ packets but none carry a PCR on 34 — check the PID list.
 curl -s 'http://localhost/api/recovery.php?service_id=2' | python3 -m json.tool
 ```
 
-Expected — Part 7 fields unchanged, Part 8 fields added:
+For a service with **no** Part 7 channel — which is NCN's case — the record has
+no `rist_url` and no `marker_pid` at all:
 
 ```json
 {
   "service_id": 2,
+  "ts_id": 1,
   "name": "NCN-Guyana",
-  "marker_pid": 8176,
-  "rist_url": "rist://<ip>:5700?buffer=8000",
   "part8": 1,
   "part8_rist_url": "rist://<ip>:9800?buffer=8000",
   "part8_pcr_cut": 1,
@@ -130,55 +117,53 @@ Expected — Part 7 fields unchanged, Part 8 fields added:
 }
 ```
 
-**`rist_url` must still be there and still point at 5700.** That is what the
-Part 7 boxes in the field are using; if it has moved, stop and do not flash a
-box.
+**Also check a Part 7 service is unchanged** — that is the isolation test that
+matters to boxes in the field:
 
-Then the anchor, which is the query the box makes at zap. Take a current PCR
-from the catalogue first:
+```sh
+curl -s 'http://localhost/api/recovery.php?service_id=<a Part 7 service>'
+```
+
+It must still carry `rist_url` and `marker_pid` exactly as before, with no Part
+8 keys added.
+
+Then the anchor, which is the query the box makes at zap:
 
 ```sh
 echo bounds | socat - UNIX-CONNECT:/run/part8-recovery/ncn-guyana/debug.sock
 curl -s 'http://localhost/api/recovery.php?service_id=2&pcr=<a PCR from bounds>'
 ```
 
-The record comes back with an `anchor` object:
-
-```json
-"anchor": { "status": "OK", "pcr_pid": 34, "actual_pcr": ..., "start_ext": ..., "start_wire": ... }
-```
-
-`start_wire` is the RTP sequence number carrying that PCR — the box aligns on
-it. A status of `OUTSIDE_BUFFER` or `TOO_OLD` is a correct answer to a stale
+The record comes back with an `anchor` object; `start_wire` is the RTP sequence
+carrying that PCR. `OUTSIDE_BUFFER` or `TOO_OLD` is a correct answer to a stale
 PCR, not a fault.
 
 ---
 
 ## 5. Flash the box
 
-The box picks Part 8 up from the API with no local config: `part8_rist_url`
-replaces `rist_url` for this service, and `part8_pcr_cut` turns its own cutter
-on using **its own** PCR PID from the tuned PMT.
+No local config. The box finds service 2 in the API, sees `part8_rist_url`,
+connects there instead of a Part 7 peer, and turns its own cutter on using
+**its own** PCR PID from the tuned PMT.
 
-After the zap, in the box log:
+After the zap:
 
 ```
 chain: recovery peer = rist://<ip>:9800?buffer=8000 (Part 8 per-channel sender)
 ```
 
-and no warning line. If you see
+and no warning. If you see
 
 ```
 chain: WARNING headend PCR PID 0x.... != ours 0x0022
 ```
 
-the uplink is renumbering and the two filtered streams cannot match — Part 8 is
-not usable on that path, whatever the GUI let you enable.
+the path between our ingest and the dish is renumbering PIDs, so the two
+filtered streams cannot match and Part 8 is not usable on it.
 
-`/tmp/ristpcrcut` still forces the cutter on for a bench box talking to a
-headend that has not been switched over. It is an override, not the production
-route, and it is ORed with the API — so leaving it set will not turn Part 8
-*off* on a channel the headend has enabled.
+`/tmp/ristpcrcut` still forces the box's cutter on for bench work against a
+headend that has not been switched over. It is ORed with the API, so leaving it
+set cannot turn Part 8 *off* on a channel the headend has enabled.
 
 ---
 
@@ -186,9 +171,8 @@ route, and it is ORed with the API — so leaving it set will not turn Part 8
 
 | how far back | what to do |
 |---|---|
-| stop Part 8 for this channel | **P8 stop** in the GUI |
-| remove Part 8 from this channel | untick the box and save — stops, disables and deletes both units and the env file |
-| put the sender back to fixed-7 without touching anything else | delete `-C 34` from `P8_EXTRA` in `/etc/part8/instances/ncn-guyana.env`, then `sudo part8-unit restart ncn-guyana` |
-| take the box back to Part 7 | the API stops advertising `part8` as soon as the unit is inactive, so a **P8 stop** is enough — the box falls back to `rist_url` on its next fetch |
+| stop the channel | **Stop** in the Part 8 table |
+| remove it entirely | **Delete** — stops, disables and removes both units and the env file |
+| fixed-7 framing, nothing else changed | delete `-C 34` from `P8_EXTRA` in `/etc/part8/instances/ncn-guyana.env`, then `sudo part8-unit restart ncn-guyana` |
 
-None of these touch `ristsender-ncn-guyana` or `ristmarker-ncn-guyana`.
+None of these touch a Part 7 unit or `channels.json`.

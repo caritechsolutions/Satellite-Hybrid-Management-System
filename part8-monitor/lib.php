@@ -111,7 +111,14 @@ function p8_ports_in_use(?string $exclude = null, ?array &$problems = null): arr
     }
 
     // 2b. the SHMS channel config, for channels whose units are not written yet
+    //
+    // part8-channels.json holds the standalone Part 8 recovery channels and has
+    // to be in this list: a created-but-not-started Part 8 channel owns p8_port
+    // and p8_tsp_port while holding no socket, so neither the unit scan above
+    // nor /proc/net can see it, and allocating over it would collide the moment
+    // someone pressed Start.
     foreach (['/opt/shms/rist-monitor/config/channels.json',
+              '/opt/shms/rist-monitor/config/part8-channels.json',
               '/opt/shms/rist-monitor/config/transports.json'] as $cf) {
         if (!file_exists($cf)) continue;               // absent is fine
         if (!is_readable($cf)) {                        // present but unreadable is NOT

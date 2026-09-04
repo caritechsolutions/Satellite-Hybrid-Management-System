@@ -8,6 +8,7 @@
 //                              Part 7 markers for the uplink mux.
 
 require_once dirname(__DIR__) . '/config/config.php';
+require_once __DIR__ . '/ts-analysis.php';
 
 if (!defined('CHANNELS_FILE'))      define('CHANNELS_FILE', CONFIG_DIR . '/channels.json');
 // Part 7 marker sender. headend_part7_sender excludes PSI from non_null, which
@@ -32,32 +33,6 @@ if (!defined('INTERNAL_MCAST_PREFIX')) define('INTERNAL_MCAST_PREFIX', '238.0.0.
 if (!defined('TSP_BINARY'))         define('TSP_BINARY', '/usr/bin/tsp');
 if (!defined('ANALYSE_SECONDS'))    define('ANALYSE_SECONDS', 5);
 if (!defined('STATS_LOCK_DIR'))     define('STATS_LOCK_DIR', sys_get_temp_dir());
-
-// ---------------------------------------------------------------- Part 8
-// The per-channel Part 8 recovery chain. Everything here is inert on a channel
-// whose 'part8' flag is off, which is every channel that predates it.
-//
-// The sender is part8_recovery_server, NOT ristsender: require_selection is on
-// by default there and is API-only in librist, the weight-1000 semantics and
-// retry path are the deployed ones, and it already builds the PCR -> sequence
-// catalogue that the anchor query answers from.
-//
-// It runs under the EXISTING part8-recovery@ template through the EXISTING
-// part8-unit helper, so no new unit file, no new sudoers entry and no widening
-// of either helper. -C reaches the binary through P8_EXTRA in the env file.
-if (!defined('P8_HELPER_BIN'))      define('P8_HELPER_BIN', '/usr/local/sbin/part8-unit');
-if (!defined('P8_LIB'))             define('P8_LIB', '/opt/shms/part8-monitor/lib.php');
-if (!defined('P8_RUN'))             define('P8_RUN', '/run/part8-recovery');
-if (!defined('PORT_BASE_P8_TSP'))   define('PORT_BASE_P8_TSP', 6400);
-// A distinct slice of the internal fabric, so a Part 8 hop can never land on a
-// Part 7 marker hop however many channels exist.
-if (!defined('P8_MCAST_OFFSET'))    define('P8_MCAST_OFFSET', 128);
-// VSF TR-06-4 4.3 broadcast PSI. FIXED, not derived from what the analysis
-// happened to see: V1 found NIT and TDT/TOT entirely absent on this
-// transponder, and a list derived from presence would change the moment a table
-// appeared -- on one side only, which is the whole failure this design exists
-// to avoid.
-if (!defined('P8_PSI_PIDS'))        define('P8_PSI_PIDS', '0,1,16,17,18,19,20');
 
 class ChannelService
 {
@@ -140,8 +115,11 @@ class ChannelService
         foreach ($data['channels'] as &$ch) {
             $ch['status'] = $this->serviceState('ristsender-' . $ch['id']);
             $ch['marker_status'] = $this->serviceState('ristmarker-' . $ch['id']);
-            $ch['part8_status'] = !empty($ch['part8'])
-                                ? $this->p8State($ch['id']) : 'off';
+            // A record left over from the build where Part 8 was a flag on this
+            // form. Reported, never acted on and never written back: Part 8 is
+            // its own record now (Part8Service), and this file no longer knows
+            // anything about it.
+            if (!empty($ch['part8'])) $ch['stale_part8_flag'] = true;
             // json_encode turns an empty PHP array into [] - a JSON ARRAY. The
             // browser then treats remap as an array and a numeric assignment
             // creates a sparse one full of nulls. Force an object.
@@ -156,14 +134,8 @@ class ChannelService
             if ($ch['id'] === $id) {
                 $ch['status'] = $this->serviceState('ristsender-' . $id);
                 $ch['marker_status'] = $this->serviceState('ristmarker-' . $id);
-                $ch['part8_status'] = !empty($ch['part8']) ? $this->p8State($id) : 'off';
                 $ch['remap'] = (object)(isset($ch['remap']) ? $ch['remap'] : []);
-                // Derived, never stored: recomputing keeps it honest against a
-                // re-analysis rather than serving a stale set.
-                if (!empty($ch['part8'])) {
-                    try { $ch['part8_filter_pids'] = $this->p8FilterPids($ch); }
-                    catch (Exception $e) { $ch['part8_filter_error'] = $e->getMessage(); }
-                }
+                if (!empty($ch['part8'])) $ch['stale_part8_flag'] = true;
                 return $ch;
             }
         }
@@ -204,9 +176,6 @@ class ChannelService
             'declare_marker' => !empty($input['declare_marker']),
             'out_service_id' => $this->validOutSvc($input['out_service_id'] ?? 0),
             'remap'          => $this->validRemap($input['remap'] ?? []),
-            // Off on creation without exception. Part 8 needs an analysis, and
-            // a channel cannot have one before its input has been read.
-            'part8'          => false,
             'created_at'     => date('c'),
         ];
 
@@ -250,13 +219,6 @@ class ChannelService
             if (array_key_exists('remap', $input)) $ch['remap'] = $this->validRemap($input['remap']);
             if (array_key_exists('declare_marker', $input)) $ch['declare_marker'] = !empty($input['declare_marker']);
             if (array_key_exists('out_service_id', $input)) $ch['out_service_id'] = $this->validOutSvc($input['out_service_id']);
-            if (array_key_exists('part8', $input)) {
-                $want = !empty($input['part8']);
-                // Validate BEFORE storing, so a refusal leaves the channel
-                // exactly as it was rather than half-enabled.
-                if ($want) $this->p8Refuse($ch);
-                $ch['part8'] = $want;
-            }
             $ch['updated_at'] = date('c');
 
             $updated = $ch;
@@ -270,11 +232,6 @@ class ChannelService
         foreach ($data['channels'] as &$c2) {
             if ($c2['id'] === $id) {
                 $this->ensurePorts($c2, $data['channels']);
-                // Allocate BEFORE the write, so the ports the units are about to
-                // reference are the ports on disk. p8EnsurePorts() refuses
-                // rather than guessing, and refusing here leaves the stored
-                // channel exactly as it was.
-                if (!empty($c2['part8'])) $this->p8EnsurePorts($c2, $data['channels']);
                 $updated = $c2;
             }
         }
@@ -501,323 +458,6 @@ class ChannelService
                        $stages, $dest);
     }
 
-    // ---------------------------------------------------------------- Part 8
-
-    /**
-     * Why a channel may not run Part 8. Throws; returns nothing on success.
-     *
-     * Both refusals are gates rather than warnings, because both produce a
-     * stream that looks fine and repairs wrongly.
-     */
-    private function p8Refuse($ch)
-    {
-        $a = isset($ch['analysis']) && is_array($ch['analysis']) ? $ch['analysis'] : null;
-        if (!$a || (int)($a['pcr_pid'] ?? 0) <= 0) {
-            throw new Exception(
-                'Analyse the input first - Part 8 derives the filter PID set and '
-              . 'the PCR PID from the analysis, so that nothing has to be typed.');
-        }
-
-        // The box and the headend must filter the SAME PID numbers, because a
-        // sequence number indexes bytes, not services. If the uplink renumbers
-        // anything, the box's stream and ours differ at exactly the PIDs the
-        // sequence is supposed to address, and identical cutting then produces
-        // identically-wrong payloads on both sides -- which is worse than no
-        // recovery, because it looks like it is working.
-        if (!empty($ch['remap'])) {
-            throw new Exception(
-                'Part 8 cannot run on a channel with a PID remap: the box would '
-              . 'filter different PID numbers than the headend, so a recovered '
-              . 'payload would not match the stream it is repairing. Clear the '
-              . 'remap, or leave this channel on Part 7.');
-        }
-        $srcSvc = (int)($a['service_id'] ?? 0);
-        if (!empty($ch['out_service_id']) && (int)$ch['out_service_id'] !== $srcSvc) {
-            throw new Exception(
-                'Part 8 cannot run on a channel that renames its service to the '
-              . 'uplink: the PMT the box sees differs from the one sent, so the '
-              . 'filtered streams diverge.');
-        }
-    }
-
-    /**
-     * The PID set the headend filters for this channel, derived from analysis.
-     *
-     * PMT + PCR + the service's elementary streams + the fixed 4.3 PSI set.
-     * Refuses rather than guessing: a silently short list would look like a
-     * working channel and drop audio.
-     */
-    public function p8FilterPids($ch)
-    {
-        $a = isset($ch['analysis']) && is_array($ch['analysis']) ? $ch['analysis'] : null;
-        if (!$a) throw new Exception('No analysis for this channel');
-
-        $svc  = (int)($a['service_id'] ?? 0);
-        $pids = array_map('intval', explode(',', P8_PSI_PIDS));
-
-        foreach (['pmt_pid', 'pcr_pid'] as $k) {
-            if (!empty($a[$k])) $pids[] = (int)$a[$k];
-        }
-
-        // An analysis that saw more than one service is an MPTS report, and then
-        // "every non-PSI PID" is the whole transponder, not this service. In
-        // that case the per-PID service association is required, not optional.
-        $multi = isset($a['services']) && is_array($a['services']) && count($a['services']) > 1;
-        $matched = 0;
-        foreach (($a['streams'] ?? []) as $s) {
-            $owners = isset($s['services']) && is_array($s['services']) ? $s['services'] : null;
-            if ($owners === null) {
-                if ($multi) continue;              // cannot attribute it - skip
-                $pids[] = (int)$s['pid'];          // single-service report
-                $matched++;
-            } elseif (in_array($svc, array_map('intval', $owners), true)) {
-                $pids[] = (int)$s['pid'];
-                $matched++;
-            }
-        }
-
-        if ($multi && $matched === 0) {
-            throw new Exception(
-                'The analysis reports ' . count($a['services']) . ' services but '
-              . 'carries no per-PID service association, so the elementary '
-              . 'streams for service ' . $svc . ' cannot be identified. Analyse '
-              . 'a single-service input, or upgrade TSDuck so the report names '
-              . 'the service each PID belongs to.');
-        }
-        if (!$matched) {
-            throw new Exception('The analysis lists no elementary streams for this service');
-        }
-
-        $pids = array_values(array_unique(array_filter($pids, function ($p) {
-            return $p >= 0 && $p < 0x1FFF;         // never the null PID
-        })));
-        sort($pids);
-        return $pids;
-    }
-
-    // Ports for the Part 8 chain, allocated only when it is switched on.
-    // The listen port comes from the Part 8 allocator rather than nextFree():
-    // that one checks four independent sources (instances.json, channels.json,
-    // transports.json, /proc/net) and refuses rather than guessing, which is
-    // what keeps a Part 8 port off a Part 7 one.
-    private function p8EnsurePorts(&$ch, $allChannels)
-    {
-        $changed = false;
-
-        if (empty($ch['p8_port'])) {
-            if (!is_readable(P8_LIB)) {
-                throw new Exception('Part 8 port allocator not found at ' . P8_LIB);
-            }
-            require_once P8_LIB;
-            list($port, $why) = p8_alloc_port();
-            if ($port === null) throw new Exception('Part 8 port: ' . $why);
-            $ch['p8_port'] = (int)$port;
-            $changed = true;
-            logMessage('INFO', "allocated p8_port={$port} for {$ch['id']}");
-        }
-
-        if (empty($ch['p8_tsp_port'])) {
-            $used = [];
-            foreach ($allChannels as $o) {
-                if (!empty($o['p8_tsp_port']) && $o['id'] !== $ch['id']) $used[] = (int)$o['p8_tsp_port'];
-            }
-            $ch['p8_tsp_port'] = $this->nextFree(PORT_BASE_P8_TSP, $used);
-            $changed = true;
-        }
-        return $changed;
-    }
-
-    private function p8InternalAddr($ch)
-    {
-        return INTERNAL_MCAST_PREFIX
-             . (P8_MCAST_OFFSET + ((int)$ch['p8_tsp_port'] - PORT_BASE_P8_TSP));
-    }
-
-    /**
-     * filter --pid, never zap. zap regenerates the PAT and SDT and resets the
-     * continuity counters on the PSI PIDs (V1 measured all three), which the
-     * box would then see as permanent discontinuities on tables it did not
-     * lose. filter passes the original bytes through untouched.
-     */
-    public function buildP8TspCommand($ch)
-    {
-        $pids = $this->p8FilterPids($ch);
-        $src  = preg_replace('#^udp://@?#', '', $ch['input_url']);
-
-        return sprintf('%s -r -I ip %s -P filter --pid %s -O ip %s:%d --ttl 1',
-            TSP_BINARY,
-            $src,
-            implode(' --pid ', $pids),
-            $this->p8InternalAddr($ch),
-            (int)$ch['p8_tsp_port']);
-    }
-
-    // The sender's env file. part8-unit reads this on stdin and installs it as
-    // /etc/part8/instances/<id>.env; the existing template expands it.
-    private function p8EnvFile($ch, $settings)
-    {
-        $a = $ch['analysis'];
-        return "P8_INPUT=udp://@" . $this->p8InternalAddr($ch) . ':' . (int)$ch['p8_tsp_port'] . "\n"
-             . "P8_LISTEN=rist://@0.0.0.0:" . (int)$ch['p8_port']
-                 . '?weight=1000&buffer=' . (int)($ch['buffer'] ?? DEFAULT_BUFFER_SIZE) . "\n"
-             . "P8_BUFFER_MS=" . (int)($ch['buffer'] ?? DEFAULT_BUFFER_SIZE) . "\n"
-             . "P8_RCVBUF=33554432\n"
-             . "P8_SOCK_GROUP=www-data\n"
-             // -C is the whole Part 8 framing switch. Delete it from this line
-             // and the sender is the stock fixed-7 packetiser again.
-             . "P8_EXTRA=-C " . (int)$a['pcr_pid'] . "\n";
-    }
-
-    private function p8Helper($action, $id, $stdin = null)
-    {
-        $cmd = 'sudo ' . P8_HELPER_BIN . ' ' . escapeshellarg($action) . ' ' . escapeshellarg($id);
-        if ($stdin !== null) {
-            $tmp = tempnam(sys_get_temp_dir(), 'p8env');
-            file_put_contents($tmp, $stdin);
-            $cmd .= ' < ' . escapeshellarg($tmp);
-        }
-        exec($cmd . ' 2>&1', $out, $rc);
-        if (isset($tmp)) @unlink($tmp);
-        return [$rc === 0, implode("\n", $out)];
-    }
-
-    private function p8State($id)
-    {
-        list($ok, $out) = $this->p8Helper('status', $id);
-        $lines = array_values(array_filter(array_map('trim', explode("\n", $out)), 'strlen'));
-        return $lines ? $lines[0] : 'unknown';
-    }
-
-    private function p8WriteUnits(&$ch, $settings, $allChannels)
-    {
-        $this->p8Refuse($ch);
-        $this->p8EnsurePorts($ch, $allChannels);
-
-        // Build the tsp command BEFORE touching systemd: p8FilterPids() can
-        // refuse, and refusing while nothing has been installed leaves no trace.
-        $tspCmd = $this->buildP8TspCommand($ch);
-
-        list($ok, $out) = $this->p8Helper('create', $ch['id'], $this->p8EnvFile($ch, $settings));
-        if (!$ok) throw new Exception("part8-unit create failed: {$out}");
-        // The helper reports whether anything outside Part 8 moved. Record it
-        // rather than dropping it: this is the isolation evidence.
-        logMessage('INFO', "part8 create {$ch['id']}: " . str_replace("\n", ' | ', trim($out)));
-
-        $unit = 'part8-recovery@' . $ch['id'] . '.service';
-        $tsp  = 'ristsender-' . $ch['id'] . '-p8src';
-        $tspUnit = "[Unit]\n"
-            . "Description=Part 8 service filter - {$ch['name']}\n"
-            . "After={$unit} rist-mcast-bridge.service\n"
-            . "Requires=rist-mcast-bridge.service\n"
-            . "BindsTo={$unit}\n"
-            . "PartOf={$unit}\n\n"
-            . "[Service]\n"
-            . "Type=simple\n"
-            . "ExecStart=" . $tspCmd . "\n"
-            . "Restart=always\n"
-            . "RestartSec=3\n"
-            . "StandardOutput=journal\n"
-            . "StandardError=journal\n\n"
-            . "[Install]\n"
-            . "WantedBy={$unit}\n";
-        $this->putUnit($tsp, $tspUnit);
-        $this->systemctl('daemon-reload');
-        $this->systemctl('enable', $tsp);      // starts and stops with the sender
-    }
-
-    private function p8RemoveUnits($id)
-    {
-        $tsp = 'ristsender-' . $id . '-p8src';
-        $this->systemctl('stop', $tsp);
-        $this->systemctl('disable', $tsp);
-        exec('sudo ' . UNIT_HELPER . ' remove ' . escapeshellarg($tsp) . ' 2>&1');
-        // remove stops, disables and deletes the env file; it does not delete
-        // the shared template, which other instances still use.
-        $this->p8Helper('remove', $id);
-        $this->systemctl('daemon-reload');
-    }
-
-    public function startPart8($id)   { return $this->p8Helper('start',   $id)[0]; }
-    public function stopPart8($id)    { return $this->p8Helper('stop',    $id)[0]; }
-    public function restartPart8($id) { return $this->p8Helper('restart', $id)[0]; }
-
-    /**
-     * One line to the instance's debug socket. The socket is created by the
-     * unit template with -g www-data and mode 0660, so this needs no privilege.
-     */
-    private function p8Debug($id, $line, $timeout = 2)
-    {
-        $path = P8_RUN . '/' . $id . '/debug.sock';
-        if (!file_exists($path)) return [false, "no debug socket at {$path} - is part8-recovery@{$id} running?"];
-
-        $s = @stream_socket_client('unix://' . $path, $errno, $errstr, $timeout);
-        if (!$s) return [false, "cannot connect to {$path}: {$errstr}"];
-        stream_set_timeout($s, $timeout);
-        fwrite($s, $line . "\n");
-        $out = '';
-        while (!feof($s)) {
-            $chunk = fread($s, 8192);
-            if ($chunk === false || $chunk === '') break;
-            $out .= $chunk;
-            if (strlen($out) > 262144) break;
-        }
-        fclose($s);
-        return [true, $out];
-    }
-
-    /**
-     * The anchor: which RTP sequence carries a given PCR.
-     *
-     * Answered from the sender's own catalogue -- the same index the retransmit
-     * path serves from -- so it cannot disagree with what a NACK would return.
-     * The status word is passed through verbatim: a box told OUTSIDE_BUFFER can
-     * act on that, where a bare number it cannot use is worse than an error.
-     */
-    public function part8Anchor($id, $pcr, $durationMs = 0)
-    {
-        $ch = $this->getChannel($id);
-        if (!$ch) throw new Exception("Channel '{$id}' not found");
-        if (empty($ch['part8'])) throw new Exception("Part 8 is not enabled on '{$id}'");
-        $pcrPid = (int)($ch['analysis']['pcr_pid'] ?? 0);
-        if ($pcrPid <= 0) throw new Exception('No PCR PID in the analysis');
-
-        list($ok, $raw) = $this->p8Debug($id, sprintf('resolve %d %s %d',
-            $pcrPid, (string)$pcr, (int)$durationMs));
-        if (!$ok) return ['status' => 'UNAVAILABLE', 'note' => $raw];
-
-        $out = ['status' => 'UNKNOWN', 'pcr_pid' => $pcrPid, 'raw' => trim($raw)];
-        if (preg_match('/^([A-Z_]+)/', ltrim($raw), $m)) $out['status'] = $m[1];
-        foreach ([
-            'actual_pcr' => '/actual_pcr\s*=\s*(\d+)/',
-            'start_ext'  => '/start_ext\s*=\s*(\d+)/',
-            'start_wire' => '/start_wire\s*=\s*(\d+)/',
-            'end_ext'    => '/end_ext\s*=\s*(\d+)/',
-            'end_wire'   => '/end_wire\s*=\s*(\d+)/',
-            'payloads'   => '/payloads\s*=\s*(\d+)/',
-        ] as $k => $re) {
-            if (preg_match($re, $raw, $m)) $out[$k] = (int)$m[1];
-        }
-        return $out;
-    }
-
-    // The recovery record is keyed by service_id (what the box looks up); the
-    // debug socket is keyed by channel id (what systemd names). This is the only
-    // place the two are joined.
-    public function channelIdForService($serviceId)
-    {
-        foreach ($this->read()['channels'] as $ch) {
-            if ((int)($ch['service_id'] ?? 0) === (int)$serviceId) return $ch['id'];
-        }
-        return null;
-    }
-
-    public function part8Bounds($id)
-    {
-        list($ok, $raw) = $this->p8Debug($id, 'bounds');
-        if (!$ok) throw new Exception($raw);
-        return ['raw' => trim($raw)];
-    }
-
     private function writeUnits($ch, $settings)
     {
         $id     = $ch['id'];
@@ -888,23 +528,6 @@ class ChannelService
         $this->systemctl('daemon-reload');
         $this->systemctl('enable', $marker);   // so it starts with the sender
         if ($this->tspNeeded($ch)) $this->systemctl('enable', $tsp);
-
-        // Part 8 is a SEPARATE chain off the same ingest, not a modification of
-        // the one above. Nothing between here and the top of this function reads
-        // or writes a Part 8 value, and nothing below touches a Part 7 unit --
-        // which is what lets a channel serve Part 7 boxes in the field and a
-        // Part 8 box on the bench at the same time.
-        if (!empty($ch['part8'])) {
-            $all = $this->read()['channels'];
-            $this->p8WriteUnits($ch, $settings, $all);
-        } elseif (!empty($ch['p8_port'])) {
-            // Only when this channel has HAD Part 8. A channel that never did
-            // has nothing to remove, and running the teardown anyway would mean
-            // every Part 7 channel update invoked part8-unit and a daemon-reload
-            // for no reason -- side effects on units this change promised not to
-            // go near.
-            $this->p8RemoveUnits($ch['id']);
-        }
     }
 
     private function putUnit($unitName, $contents)
@@ -924,7 +547,6 @@ class ChannelService
 
     private function removeUnits($id)
     {
-        $this->p8RemoveUnits($id);
         foreach (["ristmarker-{$id}-tsp", "ristmarker-{$id}", "ristsender-{$id}"] as $svc) {
             $this->systemctl('disable', $svc);
             exec('sudo ' . UNIT_HELPER . ' remove ' . escapeshellarg($svc) . ' 2>&1');
@@ -966,141 +588,23 @@ class ChannelService
     {
         $ch = $this->getChannel($id);
         if (!$ch) throw new Exception("Channel '{$id}' not found");
-        if (!is_executable(TSP_BINARY)) throw new Exception('TSDuck (tsp) is not installed');
 
-        $lock = STATS_LOCK_DIR . "/analyse-{$id}.lock";
-        $fp = @fopen($lock, 'c');
-        if (!$fp || !flock($fp, LOCK_EX | LOCK_NB)) {
-            if ($fp) fclose($fp);
-            throw new Exception('An analysis is already running for this channel');
+        // The tsp invocation and the report parsing now live in
+        // services/ts-analysis.php, so the Part 7 and Part 8 channel types
+        // cannot drift on TSDuck's key spellings. Everything this method does
+        // around them -- the lookup, the store, the log line -- is unchanged.
+        $parsed = ts_analyse_udp($ch['input_url'], $id);
+
+        // Store it so the GUI can later warn that the source changed
+        $data = $this->read();
+        foreach ($data['channels'] as &$c) {
+            if ($c['id'] === $id) $c['analysis'] = $parsed;
         }
+        unset($c);
+        $this->write($data);
 
-        try {
-            $out = sys_get_temp_dir() . "/tsp-analyse-{$id}.json";
-            @unlink($out);
-
-            // -I ip wants host:port with no scheme
-            $src = preg_replace('#^udp://@?#', '', $ch['input_url']);
-
-            // timeout is a hard backstop: tsp on a dead input waits forever
-            $cmd = sprintf(
-                'timeout %d %s -I ip %s -P until --seconds %d '
-              . '-P analyze --json --output-file %s -O drop 2>&1',
-                ANALYSE_SECONDS + 10,
-                escapeshellcmd(TSP_BINARY),
-                escapeshellarg($src),
-                ANALYSE_SECONDS,
-                escapeshellarg($out)
-            );
-            exec($cmd, $lines, $rc);
-
-            if (!is_file($out) || filesize($out) === 0) {
-                throw new Exception('No data from ' . $ch['input_url']
-                    . ' - is the stream running? (' . trim(implode(' ', array_slice($lines, -3))) . ')');
-            }
-
-            $raw = json_decode(file_get_contents($out), true);
-            @unlink($out);
-            if (!is_array($raw)) throw new Exception('Could not parse the TSDuck report');
-
-            $parsed = $this->parseAnalysis($raw);
-            $parsed['analysed_at'] = date('c');
-
-            // Store it so the GUI can later warn that the source changed
-            $data = $this->read();
-            foreach ($data['channels'] as &$c) {
-                if ($c['id'] === $id) $c['analysis'] = $parsed;
-            }
-            unset($c);
-            $this->write($data);
-
-            logMessage('INFO', "analysed {$id}: " . count($parsed['streams']) . ' stream(s)');
-            return $parsed;
-
-        } finally {
-            flock($fp, LOCK_UN);
-            fclose($fp);
-        }
-    }
-
-    // TSDuck's JSON key names vary a little by version, so probe a few spellings
-    // rather than assuming one. Unknown shapes degrade to an empty list instead
-    // of throwing - the raw report is kept so we can tighten this later.
-    private function parseAnalysis($raw)
-    {
-        $pick = function ($arr, $keys, $default = null) {
-            foreach ($keys as $k) {
-                if (is_array($arr) && array_key_exists($k, $arr) && $arr[$k] !== null) return $arr[$k];
-            }
-            return $default;
-        };
-
-        $svcList = $pick($raw, ['services'], []);
-        $svc     = is_array($svcList) && count($svcList) ? reset($svcList) : [];
-
-        $out = [
-            'service_id' => (int)$pick($svc, ['id', 'service-id', 'service_id'], 0),
-            'name'       => (string)$pick($svc, ['name', 'service-name'], ''),
-            'provider'   => (string)$pick($svc, ['provider', 'service-provider'], ''),
-            'pmt_pid'    => (int)$pick($svc, ['pmt-pid', 'pmt_pid'], 0),
-            'pcr_pid'    => (int)$pick($svc, ['pcr-pid', 'pcr_pid'], 0),
-            'ts_id'      => (int)$pick($pick($raw, ['ts'], []), ['id', 'ts-id'], 0),
-            'services'   => [],
-            'streams'    => [],
-        ];
-
-        // Every service, not just the first. Part 8 needs to know whether this
-        // report describes one service or a whole transponder, because "all the
-        // non-PSI PIDs" means completely different things in those two cases.
-        foreach ((is_array($svcList) ? $svcList : []) as $s) {
-            if (!is_array($s)) continue;
-            $out['services'][] = [
-                'id'   => (int)$pick($s, ['id', 'service-id', 'service_id'], 0),
-                'name' => (string)$pick($s, ['name', 'service-name'], ''),
-            ];
-        }
-
-        foreach ($pick($raw, ['pids'], []) as $p) {
-            if (!is_array($p)) continue;
-            $pid = (int)$pick($p, ['id', 'pid'], -1);
-            if ($pid < 0) continue;
-
-            // Skip stuffing and the PSI we never remap
-            if ($pid === 0x1FFF || $pid === 0x0000 || $pid === 0x0011 ||
-                $pid === 0x0010 || $pid === 0x0014 || $pid === 0x0001) continue;
-
-            // Which service(s) own this PID. TSDuck spells this several ways
-            // depending on version, and some reports omit it entirely - so it is
-            // probed, and its ABSENCE is recorded as null rather than as an
-            // empty list. p8FilterPids() treats those differently: on a
-            // single-service report absent means "this service", on an MPTS
-            // report it means "unknown", and guessing there would silently drop
-            // audio.
-            $owners = null;
-            foreach (['services', 'service-list', 'service_ids'] as $k) {
-                if (isset($p[$k]) && is_array($p[$k])) {
-                    $owners = array_values(array_map('intval', $p[$k]));
-                    break;
-                }
-            }
-            if ($owners === null) {
-                foreach (['service-id', 'service_id'] as $k) {
-                    if (isset($p[$k]) && is_numeric($p[$k])) { $owners = [(int)$p[$k]]; break; }
-                }
-            }
-
-            $stream = [
-                'pid'         => $pid,
-                'description' => (string)$pick($p, ['description', 'usage'], ''),
-                'bitrate'     => (int)$pick($p, ['bitrate'], 0),
-                'is_pmt'      => ($pid === $out['pmt_pid']),
-                'is_pcr'      => ($pid === $out['pcr_pid']),
-            ];
-            if ($owners !== null) $stream['services'] = $owners;
-            $out['streams'][] = $stream;
-        }
-        usort($out['streams'], function ($a, $b) { return $a['pid'] <=> $b['pid']; });
-        return $out;
+        logMessage('INFO', "analysed {$id}: " . count($parsed['streams']) . ' stream(s)');
+        return $parsed;
     }
 
     // remap is { "<from-pid>": <to-pid>, ... }
@@ -1146,15 +650,9 @@ class ChannelService
 
         foreach ($data['channels'] as $ch) {
             if ((int)($ch['service_id'] ?? 0) === 0) continue;                 // not addressable
+            if ($this->serviceState('ristsender-' . $ch['id']) !== 'active') continue;
 
-            $p7 = ($this->serviceState('ristsender-' . $ch['id']) === 'active');
-            $p8 = !empty($ch['part8']) && $this->p8State($ch['id']) === 'active';
-
-            // A channel with neither path up is not advertised at all, exactly
-            // as before. Part 7 alone still produces the record it always did.
-            if (!$p7 && !$p8) continue;
-
-            $rec = [
+            $out[] = [
                 'service_id' => (int)$ch['service_id'],
                 'ts_id'      => (int)($ch['ts_id'] ?? 0),
                 'name'       => $ch['name'],
@@ -1164,34 +662,6 @@ class ChannelService
                                         (int)$ch['recovery_port'],
                                         (int)($ch['buffer'] ?? DEFAULT_BUFFER_SIZE)),
             ];
-
-            // ADDITIVE. Every key above keeps its name, type and meaning, and a
-            // Part 7 box parses this record with cJSON, which ignores keys it
-            // does not know. A field box therefore sees no change at all.
-            if ($p8) {
-                $rec['part8']          = 1;
-                $rec['part8_rist_url'] = sprintf('rist://%s:%d?buffer=%d',
-                                                 $ip, (int)$ch['p8_port'],
-                                                 (int)($ch['buffer'] ?? DEFAULT_BUFFER_SIZE));
-                // Tells the box to turn ITS cutter on. It must still take the
-                // PID from its own PMT -- see part8_server_pcr_pid below.
-                $rec['part8_pcr_cut']  = 1;
-                // DIAGNOSTIC ONLY. This is the PCR PID before the uplink mux.
-                // The box's is what it sees after, from GxBus_PmProgGetById().
-                // They are equal only while nothing is renumbered, which is what
-                // p8Refuse() enforces -- but the box must still use its own,
-                // because that is the PID present in the bytes it is cutting.
-                $rec['part8_server_pcr_pid'] = (int)($ch['analysis']['pcr_pid'] ?? 0);
-                try {
-                    $rec['part8_filter_pids'] = $this->p8FilterPids($ch);
-                } catch (Exception $e) {
-                    // Advertise the channel without the list rather than
-                    // dropping recovery for it; the box can still connect.
-                    logMessage('WARNING', "part8 filter pids for {$ch['id']}: " . $e->getMessage());
-                }
-            }
-
-            $out[] = $rec;
         }
         return $out;
     }
