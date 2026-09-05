@@ -278,14 +278,65 @@ static void disc_record(uint16_t pid, uint8_t kind, uint32_t epoch,
 	pthread_mutex_unlock(&disc_lock);
 }
 
+/*
+ * Shutdown must always terminate, and it did not.
+ *
+ * Observed on the live headend: SIGINT was caught and the process kept running
+ * until it was killed. It could not be reproduced here -- SIGINT and SIGTERM
+ * both exit cleanly with a feed running, with a debug client attached, and with
+ * a RIST peer connected -- so this does not claim to have found the blocked
+ * call. It makes the hang impossible instead, three ways:
+ *
+ *   1. The handlers are installed with sigaction() and NO SA_RESTART, so any
+ *      blocking syscall returns EINTR rather than resuming. signal() on glibc
+ *      is BSD semantics, i.e. SA_RESTART, which is the opposite of what a
+ *      shutdown path wants.
+ *   2. A second signal exits immediately. A second Ctrl-C now always works.
+ *   3. A hard deadline. The first signal arms alarm(), and SIGALRM _exit()s.
+ *      Wherever cleanup blocks, the process is gone within the deadline, its
+ *      sockets released by the kernel -- which is the property that actually
+ *      matters, because an orphan holding the UDP port makes the next start
+ *      bind and receive nothing.
+ *
+ * alarm(), write() and _exit() are all async-signal-safe. The staged [STOP]
+ * logging in main() means a recurrence names the stage it died in.
+ */
+#define P8_SHUTDOWN_DEADLINE_S 8
+
+static volatile sig_atomic_t signalled = 0;
+
 static void on_signal(int sig)
 {
 	(void)sig;
+	if (signalled) {
+		/* Asked twice. Do not negotiate. */
+		_exit(1);
+	}
+	signalled = 1;
 	running = 0;
+	alarm(P8_SHUTDOWN_DEADLINE_S);
 	if (shutdown_pipe[1] >= 0) {
 		char c = 1;
 		(void)!write(shutdown_pipe[1], &c, 1);
 	}
+}
+
+static void on_alarm(int sig)
+{
+	(void)sig;
+	/* Cleanup outstayed its welcome. Leaving is better than holding the port. */
+	_exit(0);
+}
+
+/* sigaction without SA_RESTART, so waits are interrupted rather than resumed. */
+static void install_handler(int sig, void (*fn)(int))
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = fn;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(sig, &sa, NULL);
 }
 
 /*
@@ -1915,8 +1966,9 @@ int main(int argc, char *argv[])
 	/* A stats client that hangs up mid-response must not be able to kill the
 	 * recovery path. Writes report EPIPE instead and are handled locally. */
 	signal(SIGPIPE, SIG_IGN);
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
+	install_handler(SIGINT,  on_signal);
+	install_handler(SIGTERM, on_signal);
+	install_handler(SIGALRM, on_alarm);
 
 	char host[256] = "";
 	int port = 0;
@@ -2048,13 +2100,21 @@ int main(int argc, char *argv[])
 		if (now_us() > next_log) { log_periodic(); tripwire_rate_check(); next_log = now_us() + 5000000ULL; }
 	}
 
-	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] shutting down\n");
+	/* Staged, and each stage logged BEFORE it is entered. The live hang could
+	 * not be reproduced, so the next one has to say where it is: whichever
+	 * [STOP] line is the last one printed names the call that blocked. */
+	rist_log(&logging_settings, RIST_LOG_INFO,
+		"[STOP] shutting down (hard deadline %ds)\n", P8_SHUTDOWN_DEADLINE_S);
 	log_periodic();
+	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] closing input\n");
 	close(in);
+	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] joining debug thread\n");
 	pthread_join(dbg, NULL);
 	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] debug thread joined\n");
+	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] rist_destroy\n");
 	rist_destroy(sender_ctx);
 	if (shutdown_pipe[0] >= 0) { close(shutdown_pipe[0]); close(shutdown_pipe[1]); }
+	alarm(0);                       /* got here in time; stand the backstop down */
 	rist_log(&logging_settings, RIST_LOG_INFO, "[STOP] clean exit\n");
 	return 0;
 }

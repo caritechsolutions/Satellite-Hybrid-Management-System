@@ -12,11 +12,19 @@
 //
 //   shared transponder ingest (multicast, existing, untouched)
 //     -> tsp -r -I ip <ingest> -P filter --pid <this service's PIDs>
-//                              -O ip 238.0.0.<n>:<port> --ttl 1
-//     -> part8_recovery_server -i udp://@238.0.0.<n>:<port>
+//                              -O ip 127.0.0.1:<port>
+//     -> part8_recovery_server -i udp://@127.0.0.1:<port>
 //                              -o rist://@0.0.0.0:<9800..9899>?weight=1000
 //                              -C <pcr_pid>
 //     -> box
+//
+// The filter -> cutter hop is LOOPBACK UNICAST, not the 238.0.0.0/8 fabric.
+// part8_recovery_server binds a multicast port but never joins the group, and
+// br-rist is member-less so it comes up NO-CARRIER -- either alone is enough to
+// make the cutter read nothing, and both were observed doing exactly that. Part
+// 7 needs the fabric because its internal hops are consumed by `tsp -I ip`,
+// which rejects a unicast address; Part 8's consumer binds whatever it is
+// given, so the reason never applied here. Part 8 has no br-rist dependency.
 //
 // SEPARATE STORE, and that is the point. Nothing in this file opens, writes or
 // locks channels.json, so "no Part 7 record changed" is a property of the code
@@ -40,11 +48,6 @@ if (!defined('P8_UNIT_HELPER'))   define('P8_UNIT_HELPER', '/usr/local/sbin/rist
 if (!defined('P8_LIB'))           define('P8_LIB', '/opt/shms/part8-monitor/lib.php');
 if (!defined('P8_RUN'))           define('P8_RUN', '/run/part8-recovery');
 if (!defined('P8_TSP_BINARY'))    define('P8_TSP_BINARY', '/usr/bin/tsp');
-if (!defined('PORT_BASE_P8_TSP')) define('PORT_BASE_P8_TSP', 6400);
-// A distinct slice of the internal 238.0.0.0/8 fabric, so a Part 8 hop can
-// never land on a Part 7 marker hop however many channels exist.
-if (!defined('P8_MCAST_PREFIX'))  define('P8_MCAST_PREFIX', '238.0.0.');
-if (!defined('P8_MCAST_OFFSET'))  define('P8_MCAST_OFFSET', 128);
 if (!defined('P8_DEFAULT_BUFFER')) define('P8_DEFAULT_BUFFER', 8000);
 // VSF TR-06-4 4.3 broadcast PSI. FIXED, not derived from what the analysis
 // happened to see: V1 found NIT and TDT/TOT entirely absent on this
@@ -125,8 +128,17 @@ class Part8Service
                                     (int)$ch['p8_port'], (int)$ch['buffer']);
         $ch['internal']   = $this->internalAddr($ch) . ':' . (int)$ch['p8_tsp_port'];
         if (!empty($ch['analysis'])) {
-            try { $ch['filter_pids'] = $this->filterPids($ch); }
-            catch (Exception $e) { $ch['filter_error'] = $e->getMessage(); }
+            // pcr_pid and pmt_pid are surfaced HERE, resolved for this
+            // channel's own service. The GUI must never read
+            // analysis.pcr_pid -- that is services[0]'s, i.e. a different
+            // service on any shared transponder ingest.
+            try {
+                $ch['pcr_pid']     = $this->pcrPid($ch);
+                $ch['pmt_pid']     = $this->pmtPid($ch);
+                $ch['filter_pids'] = $this->filterPids($ch);
+            } catch (Exception $e) {
+                $ch['filter_error'] = $e->getMessage();
+            }
         }
         return $ch;
     }
@@ -244,22 +256,62 @@ class Part8Service
     }
 
     /**
-     * The PID set the headend filters for this channel, derived from analysis.
+     * THIS channel's service in the analysis report, never services[0].
      *
-     * PMT + PCR + this service's elementary streams + the fixed 4.3 PSI set.
-     * Refuses rather than guessing: a silently short list looks like a working
-     * channel and drops audio.
+     * The analysis carries a top-level service_id / pmt_pid / pcr_pid, and they
+     * describe whichever service TSDuck listed first. On a shared transponder
+     * ingest that is a different service from the one this channel selected, so
+     * nothing in Part 8 may read them -- it is how the cutter ended up with
+     * TLC-GUYANA's PCR PID (0x0021) on an NCN-Guyana channel and never cut.
+     *
+     * Refuses when the service is not in the report rather than falling back:
+     * the fallback IS the bug.
      */
-    public function filterPids($ch)
+    private function serviceEntry($ch)
     {
         $a = isset($ch['analysis']) && is_array($ch['analysis']) ? $ch['analysis'] : null;
         if (!$a) throw new Exception('No analysis for this channel - Analyse the input first');
+        $want = (int)($ch['service_id'] ?? 0);
 
+        foreach (($a['services'] ?? []) as $s) {
+            if ((int)($s['id'] ?? 0) === $want) return $s;
+        }
+
+        // An older analysis, from before services[] carried pmt_pid/pcr_pid.
+        // Only usable when the top-level record demonstrably describes THIS
+        // service; otherwise it is exactly the wrong-service data to avoid.
+        if ((int)($a['service_id'] ?? 0) === $want && $want !== 0) {
+            return ['id'      => $want,
+                    'name'    => (string)($a['name'] ?? ''),
+                    'pmt_pid' => (int)($a['pmt_pid'] ?? 0),
+                    'pcr_pid' => (int)($a['pcr_pid'] ?? 0)];
+        }
+
+        $seen = array_map(function ($s) { return (int)($s['id'] ?? 0); }, $a['services'] ?? []);
+        throw new Exception(
+            "Service {$want} is not in the analysis of this ingest (it reports "
+          . (count($seen) ? implode(', ', $seen) : 'none')
+          . '). Re-analyse, or correct the Service ID.');
+    }
+
+    /**
+     * The PID set the headend filters for this channel, derived from analysis.
+     *
+     * This service's PMT + PCR + its elementary streams + the fixed 4.3 PSI
+     * set. Refuses rather than guessing: a silently short list looks like a
+     * working channel and drops audio, and a silently WRONG one looks like a
+     * working channel and repairs into the wrong bytes.
+     */
+    public function filterPids($ch)
+    {
+        $a    = $ch['analysis'];
         $svc  = (int)($ch['service_id'] ?? 0);
+        $me   = $this->serviceEntry($ch);
         $pids = array_map('intval', explode(',', P8_PSI_PIDS));
 
+        // From THIS service's PMT declaration, not the report's first service.
         foreach (['pmt_pid', 'pcr_pid'] as $k) {
-            if (!empty($a[$k])) $pids[] = (int)$a[$k];
+            if (!empty($me[$k])) $pids[] = (int)$me[$k];
         }
 
         // An analysis that saw more than one service is an MPTS report, and
@@ -296,45 +348,109 @@ class Part8Service
         return $pids;
     }
 
+    /**
+     * The PCR PID the cutter is given, strictly as declared in THIS service's
+     * PMT. Never scanned for, never taken from the report's first service.
+     */
     public function pcrPid($ch)
     {
-        $p = (int)($ch['analysis']['pcr_pid'] ?? 0);
+        $me = $this->serviceEntry($ch);
+        $p  = (int)($me['pcr_pid'] ?? 0);
         if ($p <= 0 || $p >= 0x1FFF) {
-            throw new Exception('No usable PCR PID in the analysis - Analyse the input first');
+            throw new Exception(sprintf(
+                'The analysis reports no PCR PID for service %d%s. Without it '
+              . 'the cutter has nothing to cut on.',
+                (int)($ch['service_id'] ?? 0),
+                !empty($me['name']) ? " ({$me['name']})" : ''));
         }
         return $p;
     }
 
-    // ---------------------------------------------------------------- ports
-
-    // The listen port comes from the Part 8 allocator in part8-monitor/lib.php:
-    // it checks four independent sources and refuses rather than guessing,
-    // which is what keeps a Part 8 port off a Part 7 one.
-    private function ensurePorts(&$ch, $allChannels)
+    public function pmtPid($ch)
     {
-        if (empty($ch['p8_port'])) {
-            if (!is_readable(P8_LIB)) throw new Exception('Part 8 port allocator not found at ' . P8_LIB);
-            require_once P8_LIB;
-            list($port, $why) = p8_alloc_port();
-            if ($port === null) throw new Exception('Part 8 port: ' . $why);
-            $ch['p8_port'] = (int)$port;
-            logMessage('INFO', "part8 allocated p8_port={$port} for {$ch['id']}");
-        }
-        if (empty($ch['p8_tsp_port'])) {
-            $used = [];
-            foreach ($allChannels as $o) {
-                if (!empty($o['p8_tsp_port']) && $o['id'] !== $ch['id']) $used[] = (int)$o['p8_tsp_port'];
-            }
-            for ($p = PORT_BASE_P8_TSP; $p < PORT_BASE_P8_TSP + 100; $p++) {
-                if (!in_array($p, $used, true)) { $ch['p8_tsp_port'] = $p; break; }
-            }
-            if (empty($ch['p8_tsp_port'])) throw new Exception('No free internal port in the 6400 range');
-        }
+        return (int)($this->serviceEntry($ch)['pmt_pid'] ?? 0);
     }
 
+    // ---------------------------------------------------------------- ports
+
+    /**
+     * Both ports from the Part 8 allocator in part8-monitor/lib.php: it checks
+     * four independent sources (part8 instances, the two SHMS channel configs,
+     * running Part 7 units and /proc/net) and refuses rather than guessing.
+     *
+     * BOTH, not just the listen port. The filter -> cutter hop is loopback
+     * unicast now, so p8_tsp_port is a real port on 127.0.0.1 that has to be
+     * unique across the whole host -- when it was a per-channel multicast group
+     * the port could repeat harmlessly, and it no longer can.
+     *
+     * Allocated together in one pass: p8_alloc_port() reads the stored config,
+     * so calling it twice before the first result is written returns the same
+     * port both times.
+     */
+    private function ensurePorts(&$ch, $allChannels)
+    {
+        $needListen = empty($ch['p8_port']);
+        $needTsp    = empty($ch['p8_tsp_port']);
+        if (!$needListen && !$needTsp) return;
+
+        if (!is_readable(P8_LIB)) throw new Exception('Part 8 port allocator not found at ' . P8_LIB);
+        require_once P8_LIB;
+
+        // Ports already held by our other channels, taken from the list in hand
+        // rather than from the file. The allocator reads part8-channels.json at
+        // a fixed deployed path, so it is blind to anything not yet flushed
+        // there -- and with the loopback hop these ports are real bind targets
+        // on 127.0.0.1, where a duplicate means the second channel's cutter
+        // silently receives the first channel's stream. Cheap to exclude, and
+        // it removes the dependency on that path being right.
+        $peer = [];
+        foreach ($allChannels as $o) {
+            if (($o['id'] ?? null) === $ch['id']) continue;
+            foreach (['p8_port', 'p8_tsp_port'] as $k) {
+                if (!empty($o[$k])) $peer[(int)$o[$k]] = true;
+            }
+        }
+
+        $need = (int)$needListen + (int)$needTsp;
+        list($cand, $why) = p8_alloc_ports($need + count($peer), $ch['id']);
+        if ($cand === null) throw new Exception('Part 8 ports: ' . $why);
+
+        $ports = array_values(array_filter($cand, function ($p) use ($peer) {
+            return !isset($peer[$p]);
+        }));
+        if (count($ports) < $need) {
+            throw new Exception('Part 8 ports: not enough free ports once the '
+                              . 'other Part 8 channels are excluded');
+        }
+
+        if ($needListen) $ch['p8_port']     = (int)array_shift($ports);
+        if ($needTsp)    $ch['p8_tsp_port'] = (int)array_shift($ports);
+        logMessage('INFO', sprintf('part8 ports for %s: listen=%d loopback=%d',
+            $ch['id'], (int)$ch['p8_port'], (int)$ch['p8_tsp_port']));
+    }
+
+    /**
+     * The filter -> cutter hop. LOOPBACK UNICAST, deliberately.
+     *
+     * It used to be a 238.0.0.x group on br-rist, and that does not work, for
+     * two independent reasons found on the live headend:
+     *
+     *   - part8_recovery_server binds the port but never joins the group; there
+     *     is no IP_ADD_MEMBERSHIP anywhere in it. `ip maddr show br-rist` showed
+     *     the Part 7 group joined and the Part 8 group absent, and the cutter
+     *     read ts=0 for the whole run.
+     *   - br-rist is a member-less bridge and comes up NO-CARRIER, so multicast
+     *     to it black-holes until something forces a dummy member up.
+     *
+     * Part 7 needs the multicast fabric because its internal hops are consumed
+     * by `tsp -I ip`, which rejects a unicast address. Part 8's consumer is
+     * part8_recovery_server, which binds whatever it is given -- so the reason
+     * never applied here, and dropping it removes both failures and the br-rist
+     * dependency with them.
+     */
     private function internalAddr($ch)
     {
-        return P8_MCAST_PREFIX . (P8_MCAST_OFFSET + ((int)$ch['p8_tsp_port'] - PORT_BASE_P8_TSP));
+        return '127.0.0.1';
     }
 
     // ---------------------------------------------------------------- units
@@ -350,7 +466,10 @@ class Part8Service
         $pids = $this->filterPids($ch);
         $src  = preg_replace('#^udp://@?#', '', $ch['input_url']);
 
-        return sprintf('%s -r -I ip %s -P filter --pid %s -O ip %s:%d --ttl 1',
+        // -O ip to a UNICAST loopback address. No --ttl: it is meaningless on
+        // loopback, and carrying it would imply a fabric that is no longer
+        // involved.
+        return sprintf('%s -r -I ip %s -P filter --pid %s -O ip %s:%d',
             P8_TSP_BINARY, $src, implode(' --pid ', $pids),
             $this->internalAddr($ch), (int)$ch['p8_tsp_port']);
     }
@@ -388,10 +507,13 @@ class Part8Service
         // The tsp stage has to wear a rist* name because rist-unit accepts no
         // other kind. It is Part 8 regardless, and both isolation checks
         // classify -p8src as such so it does not read as a Part 7 unit moving.
+        // No rist-mcast-bridge dependency: the hop to the cutter is loopback
+        // unicast, so Part 8 needs nothing from the 238.0.0.0/8 fabric. The
+        // INGEST is still multicast, but that group is joined by tsp itself and
+        // has real members already.
         $tspUnit = "[Unit]\n"
             . "Description=Part 8 service filter - {$ch['name']}\n"
-            . "After={$unit} rist-mcast-bridge.service\n"
-            . "Requires=rist-mcast-bridge.service\n"
+            . "After={$unit}\n"
             . "BindsTo={$unit}\n"
             . "PartOf={$unit}\n\n"
             . "[Service]\n"

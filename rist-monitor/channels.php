@@ -635,13 +635,18 @@ function p8Derived(c) {
   }
   if (!c.analysis) { el.innerHTML = 'Analyse the ingest to derive the filter set.'; return; }
   const pids = c.filter_pids || [];
-  const pcr  = c.analysis.pcr_pid || 0;
+  // c.pcr_pid, NOT c.analysis.pcr_pid. The latter belongs to whichever service
+  // TSDuck listed first, which on a shared transponder ingest is somebody
+  // else's -- that is how a NCN channel got TLC-GUYANA's 0x0021.
+  const pcr  = c.pcr_pid || 0;
+  const pmt  = c.pmt_pid || 0;
+  const hex  = v => '0x' + (+v).toString(16).toUpperCase().padStart(4, '0');
   el.innerHTML =
       `sender&nbsp;&nbsp;&nbsp;part8-recovery@${esc(c.id)} &rarr; ${esc(c.rist_url || '')}<br>`
-    + `filter&nbsp;&nbsp;&nbsp;ristsender-${esc(c.id)}-p8src &rarr; ${esc(c.internal || '')}<br>`
-    + `pcr_cut&nbsp;&nbsp;${pcr} (0x${(+pcr).toString(16).toUpperCase().padStart(4,'0')})<br>`
-    + `pids&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${pids.length} &mdash; `
-    + pids.map(p => '0x' + p.toString(16).toUpperCase().padStart(4,'0')).join(' ');
+    + `filter&nbsp;&nbsp;&nbsp;ristsender-${esc(c.id)}-p8src &rarr; ${esc(c.internal || '')} <span class="hint">(loopback)</span><br>`
+    + `service&nbsp;&nbsp;${c.service_id} &mdash; PMT ${pmt} (${hex(pmt)})<br>`
+    + `pcr_cut&nbsp;&nbsp;${pcr} (${hex(pcr)})<br>`
+    + `pids&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${pids.length} &mdash; ` + pids.map(hex).join(' ');
 }
 
 async function p8Analyse() {
@@ -702,7 +707,7 @@ async function p8Load() {
       return;
     }
     rows.innerHTML = d.channels.map(c => {
-      const pcr = (c.analysis && c.analysis.pcr_pid) || 0;
+      const pcr = c.pcr_pid || 0;
       return `
       <tr>
         <td><b>${esc(c.name)}</b><div class="hint mono">${esc(c.id)}</div></td>

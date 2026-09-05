@@ -93,14 +93,26 @@ function ts_parse_analysis($raw)
         'streams'    => [],
     ];
 
-    // Every service, not just the first. Part 8 needs to know whether this
-    // report describes one service or a whole transponder, because "all the
-    // non-PSI PIDs" means completely different things in those two cases.
+    // Every service, WITH ITS OWN pmt_pid and pcr_pid.
+    //
+    // The top-level service_id / pmt_pid / pcr_pid above describe services[0]
+    // and nothing else. On a single-service input that is the whole report; on
+    // an MPTS transponder ingest it is whichever service TSDuck listed first,
+    // which is almost never the one a Part 8 channel selected.
+    //
+    // That is not cosmetic, and it shipped broken. On the live 5800 feed the
+    // first service is TLC-GUYANA (PMT 0x008D, PCR 0x0021) while NCN-Guyana is
+    // service 2 with PMT 0x008E and PCR 0x0022. Taking the top-level values
+    // gave the cutter -C 33 -- a PID it can never see a PCR on, so it never
+    // cuts -- and put TLC's PMT into NCN's filter set, which makes the two
+    // ends' byte streams differ without saying anything.
     foreach ((is_array($svcList) ? $svcList : []) as $s) {
         if (!is_array($s)) continue;
         $out['services'][] = [
-            'id'   => (int)$pick($s, ['id', 'service-id', 'service_id'], 0),
-            'name' => (string)$pick($s, ['name', 'service-name'], ''),
+            'id'      => (int)$pick($s, ['id', 'service-id', 'service_id'], 0),
+            'name'    => (string)$pick($s, ['name', 'service-name'], ''),
+            'pmt_pid' => (int)$pick($s, ['pmt-pid', 'pmt_pid'], 0),
+            'pcr_pid' => (int)$pick($s, ['pcr-pid', 'pcr_pid'], 0),
         ];
     }
 

@@ -44,8 +44,9 @@ Channels page → scroll to **Add Part 8 recovery channel**:
 **Create Part 8 channel.**
 
 The ingest is read, never consumed — the Part 7 chains on the same group keep
-working. Creating allocates a listen port in 9800–9899 and an internal port
-from 6400, and writes nothing but `config/part8-channels.json`.
+working. Creating allocates two ports in 9800–9899 (the RIST listen port and
+the loopback port the filter hands the cutter) and writes nothing but
+`config/part8-channels.json`.
 
 ## 2. Analyse the ingest
 
@@ -55,10 +56,15 @@ The derived panel then reads:
 
 ```
 sender    part8-recovery@ncn-guyana -> rist://<recovery-ip>:9800?buffer=8000
-filter    ristsender-ncn-guyana-p8src -> 238.0.0.128:6400
+filter    ristsender-ncn-guyana-p8src -> 127.0.0.1:9801 (loopback)
+service   2 - PMT 142 (0x008E)
 pcr_cut   34 (0x0022)
 pids      10 - 0x0000 0x0001 0x0010 0x0011 0x0012 0x0013 0x0014 0x0022 0x0023 0x008E
 ```
+
+**Check `pcr_cut` against NCN's own PMT, not the transponder's first service.**
+It must read 34 (0x0022). 33 (0x0021) is TLC-GUYANA's, and a cutter given it
+would never see a PCR and never cut.
 
 That is the whole configuration and none of it was typed. If it refuses, it
 says why — the two it can say are "Analyse the input first" and, on an ingest
@@ -81,7 +87,7 @@ The start log must show the framing, or the box will be cutting and the headend
 will not:
 
 ```
-[START] Part 8 recovery server: in=udp://@238.0.0.128:6400 out=rist://@0.0.0.0:9800 ...
+[START] Part 8 recovery server: in=udp://@127.0.0.1:9801 out=rist://@0.0.0.0:9800 ...
 [START] PCR-boundary framing ON, pcr_pid=0x0022 (34).
 ```
 
@@ -92,8 +98,28 @@ echo stats | socat - UNIX-CONNECT:/run/part8-recovery/ncn-guyana/debug.sock
 ```
 
 `ts_in` climbing and `pcr_cuts` climbing at roughly the PCR rate means the chain
-is alive. `pcr_cuts` stuck at 0 while `ts_in` climbs means the filter is passing
-packets but none carry a PCR on 34 — check the PID list.
+is alive.
+
+Two failure shapes worth naming, because both were seen by hand:
+
+- **`ts_in` stuck at 0.** The cutter is receiving nothing. This is what the
+  multicast hop did — the sender binds the port but never joins the group, and
+  br-rist comes up NO-CARRIER anyway. The hop is loopback unicast now, so this
+  should not recur; if it does, check the filter unit is running and that its
+  `-O ip` and the sender's `P8_INPUT` name the same port.
+- **`pcr_cuts` stuck at 0 while `ts_in` climbs.** Packets are arriving but none
+  carry a PCR on the configured PID — the classic symptom of a `-C` from the
+  wrong service.
+
+The catalogue should also be filling:
+
+```sh
+echo 'bounds' | socat - UNIX-CONNECT:/run/part8-recovery/ncn-guyana/debug.sock
+```
+
+`pid 0x0022` with a rising entry count, and `resolve 34 <newest PCR> 0` should
+answer `OK ... slot=0` — slot 0 meaning the PCR sits at the head of its payload,
+which is the whole point of the PCR-boundary framing.
 
 ## 4. Check what the box will be told
 

@@ -186,6 +186,46 @@ function p8_port_of_url(string $url): ?int
  * exact failure the rule exists to prevent -- and it would look like a working
  * allocation until something collided at runtime.
  */
+/**
+ * N distinct free ports in ONE pass over the conflict sources.
+ *
+ * Added for the Part 8 recovery channels, which need two: the RIST listen port
+ * and the loopback port the tsp filter hands the cutter. Calling
+ * p8_alloc_port() twice would return the same port both times -- it reads the
+ * stored config, and the first allocation is not stored yet.
+ *
+ * Same refusal rule as p8_alloc_port(): if any source could not be read, refuse
+ * rather than allocate while blind to it.
+ *
+ * @return array [int[] ports, null] or [null, string reason]
+ */
+function p8_alloc_ports(int $n, ?string $exclude = null): array
+{
+    $problems = [];
+    $used = p8_ports_in_use($exclude, $problems);
+    if ($problems) {
+        return [null, "cannot allocate ports safely:\n  - " . implode("\n  - ", $problems)
+                    . "\nRefusing rather than risk a collision with a Part 7 port."];
+    }
+
+    $eph = @file_get_contents('/proc/sys/net/ipv4/ip_local_port_range');
+    $lo = $hi = 0;
+    if ($eph && preg_match('/(\d+)\s+(\d+)/', $eph, $m)) { $lo = (int)$m[1]; $hi = (int)$m[2]; }
+
+    $out = [];
+    for ($p = P8_PORT_MIN; $p <= P8_PORT_MAX && count($out) < $n; $p++) {
+        if (isset($used[$p])) continue;
+        if ($lo && $p >= $lo && $p <= $hi) continue;   // inside the ephemeral range
+        $out[] = $p;
+    }
+    if (count($out) < $n) {
+        return [null, sprintf(
+            'need %d free ports in %d-%d, found %d. Refusing rather than reusing one.',
+            $n, P8_PORT_MIN, P8_PORT_MAX, count($out))];
+    }
+    return [$out, null];
+}
+
 function p8_alloc_port(?string $exclude = null): array
 {
     $problems = [];

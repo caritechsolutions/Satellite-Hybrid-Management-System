@@ -35,7 +35,8 @@ Two consequences handled rather than discovered later:
 - `part8-monitor/lib.php`'s port scan gains it too. A created-but-not-started
   Part 8 channel owns `p8_port` and `p8_tsp_port` while holding no socket, so
   neither the unit scan nor `/proc/net` can see it, and the allocator would
-  hand the same port out twice.
+  hand the same port out twice. (Since the hop became loopback, the service
+  also excludes its siblings' ports directly — see below.)
 
 ## Q2 — same page, separate section
 
@@ -127,6 +128,37 @@ keeps its signature, its storage behaviour and its log line; only the two moved
 blocks changed hands.
 
 ---
+
+## The filter → cutter hop is loopback unicast
+
+It was a `238.0.0.x` group on `br-rist`, mirroring the Part 7 marker hop. That
+does not work, for two independent reasons, both observed on the live headend:
+
+- **`part8_recovery_server` never joins the group.** There is no
+  `IP_ADD_MEMBERSHIP` anywhere in it — it binds the port and waits.
+  `ip maddr show br-rist` showed the Part 7 group joined and the Part 8 group
+  absent, and the cutter read `ts_in=0` for the entire run.
+- **`br-rist` is member-less and comes up NO-CARRIER**, so multicast to it
+  black-holes until something forces a dummy member up.
+
+Part 7 needs the fabric because its internal hops are consumed by `tsp -I ip`,
+which rejects a unicast address. **Part 8's consumer is
+`part8_recovery_server`, which binds whatever it is given**, so that reason
+never applied here.
+
+So the hop is `-O ip 127.0.0.1:<port>` into `-i udp://@127.0.0.1:<port>`, with
+no `--ttl` and no `Requires=rist-mcast-bridge.service` on the filter unit.
+
+**Does anything still need br-rist for Part 8? No.** The channel's *ingest* is
+still a multicast group, but tsp joins that itself and it has real members
+already. Part 8 has no dependency on the 238.0.0.0/8 fabric or on the bridge.
+Part 7 still does, and is untouched.
+
+Both ports now come from the Part 8 allocator in one pass (`p8_alloc_ports`),
+because a loopback port is a real host-wide bind target where a per-channel
+multicast group's port could safely repeat. Ports held by other Part 8 channels
+are excluded from the candidates directly as well, so uniqueness does not depend
+on the allocator's hard-coded config path being right.
 
 ## Isolation
 
