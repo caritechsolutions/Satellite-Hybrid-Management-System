@@ -1,330 +1,373 @@
 # Part 8 box — demux 0 fed from the RIST receiver, full time
 
-The target architecture. `tuner → dmx2 capture → cutter → local RIST sender →
-local RIST receiver → demux 0 → every consumer already bound to demux 0.` No
-runtime source switching: demux 0 is on the memory source for the whole life of
-a Part 8 channel and back on the tuner the moment the flag comes off.
+```
+frontend locks the NIM (unchanged)
+  -> dmx2 reads the frontend TS -> cutter (0x0022) -> RIST sender -> receiver
+  -> dmx0 opened MEMORY-FED (GXMEDIA_SOURCE_TS) from the receiver output
+  -> decode, app_epg (SDT/EIT), app_time (TDT) all read the repaired stream
+```
 
-Two things were to be confirmed before building. Both are answered below, and
-one of them changed the shape of the build.
+Buffer 2000 ms. `/tmp/ristp8tail = dmx0`. No runtime source switch — which
+open path runs decides everything.
 
 ---
 
-## First: two corrections to the brief
+## Not a new implementation
 
-### `g_hDemux` does not exist
+`GxMediaApi_ModuleOpen3()` takes the demux modid as a parameter, so "memory-fed
+demux 3" and "memory-fed demux 0" are the Step 2 code path with one number
+changed: `_rist_p8_tail_start(int demux_modid)`, latched into `s_rist.p8_dmx` so
+setup and teardown can never name different instances. The DVR-0 feed from the
+previous commit is gone — it was a second implementation of the same thing, and
+two of these would drift.
 
-> "the instance the consumers are ALREADY bound to via the `g_hDemux` global"
+---
 
-There is no such symbol anywhere in the SDK tree — `grep -rn g_hDemux
---include=*.c --include=*.h 6631SDK/` returns nothing. The consumers are not
-bound through a shared handle. They are bound through a **pair of numbers**,
-`g_AppPlayOps.normal_play.{ts_src, dmx_id}`, which each consumer reads and
-passes down at start:
+## D1 — open order
 
-| consumer | how it binds |
+### The mechanism that makes most of this a non-problem
+
+`GxAvdev_OpenModule()` is a **refcounted singleton per (type, id)** —
+`gxavdev.c:62-86`:
+
+```c
+if (-1 == module_handle[type][id])
+        module_handle[type][id] = GxAVOpenModule(dev, type, id);
+if (module_handle[type][id] >= 0)
+        module_opr_count[type][id]++;
+return module_handle[type][id];
+```
+
+Every consumer that opens demux 0 by instance number gets **the same handle**.
+That shared handle is the process-wide demux object the design assumes — it just
+lives as an array slot in the avdev layer rather than as a named global. So
+configuring demux 0 memory-fed configures it for all of them at once, and our
+`GxMediaApi_ModuleClose()` only decrements a count the consumers already hold.
+
+Two consequences, and they pull in opposite directions:
+
+**Slot allocation is order-independent.** Slots and filters sit *downstream* of
+the source selector. A consumer that allocated its slot while demux 0 was still
+tuner-fed simply follows when the source changes — nothing to re-attach. This is
+why "EPG works but decode doesn't" cannot arise from slot ordering.
+
+**Source *writes* are not order-independent — and exactly one consumer writes.**
+`app_epg_enable()` reaches `GxEpg_SubtChannelCreate()`, which does an
+unconditional
+
+```c
+GxDmxSetSource(epg_cfg.dmx_id, epg_cfg.ts_src);   /* gxepg_table.c:123 */
+```
+
+on every EPG channel create, with `epg_cfg.dmx_id = TS_2_DMX`, which is **0** on
+this build (`app_nim.h:28-32`; `CA_SUPPORT` is 0 and `SUBTTRANS_SUPPORT` is
+undefined). Left alone it writes the **tuner** source and silently undoes the
+tail. Every other consumer only allocates slots.
+
+### The order, exactly
+
+| # | when | what | why there |
+|---|---|---|---|
+| 1 | zap | `app_prepare_for_play()` tunes; lock poll runs | demux 0 is still **tuner-fed** — see below |
+| 2 | zap | `app_rist_play_change()` spawns sender + receiver | receiver emits nothing yet; it holds a full buffer first |
+| 3 | zap | `app_rist_screen_enabled()` → 1 → `app_player_close(PLAYER_FOR_NORMAL)` | releases the one video decoder |
+| 4 | +50 ms…delay1 | lock reported → `_rist_capture_begin()` → dmx2 capture feeds 6300 | needs a **tuner-fed demux 0** to report lock |
+| 5 | +delay3 (3000 ms) | `_rist_screen_cb` → `_rist_p8_tail_start(0)`: module open, config, start, reader | demux 0 becomes `DEMUX_SDRAM` here |
+| 6 | immediately after | `_rist_p8_epg_repoint(3, …)` — `app_epg_disable()` then `app_epg_enable(3, TS_2_DMX)` | the only source-writing consumer, re-pointed at the moment the demux changes hands |
+| 7 | ongoing | inject → decode; `app_sdt`/`app_pat`/TDT filters already on demux 0 follow the new source | |
+
+**Why the tail opens at delay3 and not at chain start.** This is the one place
+the brief's "born memory-fed at chain start" had to bend, and it is not a
+preference:
+
+`GxFrontend_QueryStatus()` (`gxfrontend.c:2352`) asks **the NIM's demux — demux
+0** for `GxDemuxPropertyID_TSLockQuery`, and `dvbs_lock_state_get()` ANDs that
+with the demod's `FE_READ_STATUS` (`app_nim_dvbs.c:285-301`). The RF tune and the
+demod lock genuinely are demux-independent — that part of "the deadlock is
+phantom" is right — but the **TS-sync half of the lock check is not**. A
+memory-fed demux 0 never reports TS sync, so opening it before the capture
+starts would make the lock poll that gates `_rist_capture_begin()` time out on
+the `delay1` ceiling on **every** zap. Opening after delay3 leaves that check
+running against a tuner-fed demux 0, exactly as today, and still puts the
+memory-fed demux 0 in place well before the receiver's first output.
+
+**Why teardown restores the source by hand.** `GxMediaApi_ModuleClose()` releases
+our ES slots but leaves the instance on `DEMUX_SDRAM`. That would break the
+*next* zap's lock poll on every channel, Part 8 or not.
+`_rist_p8_dmx_restore_tuner()` writes the tuner source back, field-for-field in
+the shape the NIM uses at `FRONTEND_OPEN` (`app_nim_dvbs.c:405-413`), and then
+EPG is re-pointed at the tuner too. The next factory play would eventually
+rewrite it anyway, but "eventually, if the right consumer happens to restart" is
+not a fallback.
+
+---
+
+## D2 — decode contention
+
+**No special case. All three tails answer the same way.** There is one hardware
+video decoder (`vd_hw.c:550`), and on every Part 8 tail something else owns it:
+
+| tail | owner of the decoder |
 |---|---|
-| `app_sdt` / `app_pat` | `app_sdt_start(g_AppPlayOps.normal_play.dmx_id, …)` (`app_play_control.c:2055,2058`) |
-| `app_epg` | `epg_cfg.dmx_id` / `epg_cfg.ts_src` → `GxDmxSetSource(epg_cfg.dmx_id, epg_cfg.ts_src)` (`gxepg_table.c:123`) |
-| `app_time` | `time.ts_src = g_AppPlayOps.normal_play.ts_src` (`app_time.c:352`) |
-| TDT (`extra_sync_time`) | `subt_detail.ts_src = ts_src`, `demux_id` left 0 by the `memset` (`gxextra.c:98,108`) |
-| ECM / CAT / EMM | `app_demux_param_adjust(&ts_src, &demux_id, 0)` (`app_pmt.c:1019`, `app_cat.c:751`, `app_emm.c:177`) |
+| `player_av` | the loopback player (Step 1) |
+| `dmx3` | our `GxMediaApi` module on demux 3 |
+| `dmx0` | our `GxMediaApi` module on demux 0 — same module, same video/audio mod id 0 |
 
-That matters, because a handle you can repoint is a different problem from a
-number every consumer copies. It also means the lever is smaller than the brief
-assumed, not larger.
+So `app_rist_screen_enabled()` returns true on `chain_active` exactly as it does
+for Part 7, `app_play_control.c:1155` calls `app_player_close(PLAYER_FOR_NORMAL)`,
+and the memory-fed module takes the decoder that releases. The module's
+video/audio/stc mod ids stay **0** on all tails — asking for a second decoder id
+would fail, or worse half-succeed.
 
-### The claim that U1 is already confirmed by file playback
+*(The previous commit inverted this suppression, on the reading that normal play
+would carry the picture. That was wrong for this architecture and is reverted.)*
 
-> "U1 already confirmed a memory-fed demux runs the full consumer chain
-> (file-playback path, GXMEDIA_SOURCE_TS)."
+**Fallback is the same single mechanism.** Any chain or tail failure clears
+`chain_active` and `p8_active` **before** `app_normal_play` reads the
+suppression decision, so suppression lifts in the same zap and factory decode
+runs. There is no path that suppresses the tuner decode for a tail that did not
+come up.
 
-I flagged last turn that file playback might section-filter in **software**,
-which would make it evidence for decode only. **I withdraw that objection.**
-`si/soft_demux/soft_demux.c` is dead code: `SOFT_DEMUX` is `#define`d to `(0)`
-at `si_filter.c:31` and defined nowhere else, so the `#else` branch that uses
-it (`si_filter.c:810-989`) never compiles. There is no software section demux
-in this build; every SI consumer goes through the hardware slot+filter path at
-`si_filter.c:358`.
+Three layers, all ending in a picture:
 
-That removes the counter-evidence. It does **not** turn into proof: nothing in
-this SDK demonstrates a hardware section filter firing on a demux whose source
-is `DEMUX_SDRAM`. What is now true is that the file-playback path and the SI
-path use the same hardware filters, so if file playback really did run SI
-tables here, U1a follows. Architecturally it should hold — `source` selects
-what feeds the demux's packet processor, and slots and filters sit after it —
-and this build is the way to find out.
+1. chain will not spawn → flags cleared → factory decode, same zap.
+2. tail will not open (any stage) → falls straight through to `player_av` on the
+   loopback — the Step 1 path, kept selectable as the diagnostic fallback.
+3. tail opens but no first frame in 12 s → torn down, source restored, EPG
+   re-pointed, screen handed to `player_av` on a 100 ms timer.
+4. `echo 0 > /tmp/ristp8` → next zap is factory, untouched.
 
----
-
-## The two questions, answered
-
-### Q1 — can demux 0 be put on the memory source without disturbing the consumers?
-
-**Not by setting the source behind their backs. Yes, by setting the one number
-they all read.**
-
-Why the direct approach is wrong, from the code:
-
-- **`dmx_sub_system.c:249-262`** keys a demux instance on `(dmx_id, ts)`. A
-  second opener asking for the same `dmx_id` with a **different** `ts` gets a
-  hard `return -1` and `"dmx sub already open!"`. Two owners disagreeing about
-  the source is not a race that settles — it is an error return that kills
-  whoever asked second.
-- **`si_filter.c`'s `ts_demux_connect()` (:213)** writes `config_demux.source =
-  ts_src` **only on the first open**. `s_Demux[id].handle` is never zeroed,
-  because the close inside `ts_demux_disconnect()` is `#if 0`'d out
-  (`:201-209`). So after boot the SI layer's opinion of the source is frozen
-  and its `ts_src` argument is ignored — good news in one direction (SI can
-  never slam demux 0 back to the tuner behind the player) and a trap in the
-  other (a source we set unilaterally is invisible to it).
-
-What **does** write the source, unconditionally, on every single play:
-
-```c
-/* platform/gxbus/player/access/dvbsource_normal.c:33-46 */
-GxUrl_GetItem(url, GX_URL_KEY_TSID,  &tsid);
-GxUrl_GetItem(url, GX_URL_KEY_DMXID, &dmxid);
-dn->dmx = GxAvdev_OpenModule(dn->dev, GXAV_MOD_DEMUX, dmxid);
-cfg_dmx.source = tsid;
-GxAVSetProperty(dn->dev, dn->dmx, GxDemuxPropertyID_Config, &cfg_dmx, ...);
-```
-
-and the URL is built from that same pair:
-
-```c
-/* app_play_control.c:962 */
-sprintf(url_tmp, "&tsid:%d&dmxid:%d&progid:%d", ts_src, dmx_id, prog->id);
-```
-
-**The SDK already has this exact branch, and it is live on this build.**
-`app_play_control.c:1089-1098`, under `PDMX_SUPPORT` (which is `1`):
-
-```c
-g_AppPlayOps.normal_play.dmx_id = config.dmx_id;      /* unchanged */
-if (app_program_need_predemux(prog_node) && !app_frontend_hard_cap(...))
-    g_AppPlayOps.normal_play.ts_src = 3;              /* SDRAM */
-else
-    g_AppPlayOps.normal_play.ts_src = config.ts_src;  /* tuner */
-```
-
-`app_demux_param_adjust()` (`app_extend.c:227`) is the same idea for timeshift:
-`if (exshift_flag || cmshift_flag) *ts_source = 3;` — currently inert
-(`EX_SHIFT_SUPPORT 0`, `CMM_SUPPORT 0`), but it is the platform saying, in its
-own code, that "insert a stage between tuner and consumers" means **change
-ts_src, keep dmx_id**.
-
-So the answer is yes, the bindings survive — because nothing about them
-changes. Every consumer keeps `dmx_id` 0. Only where demux 0 gets its bytes
-changes, and it changes through the one write the player already performs.
-
-### Q2 — does reverting `/tmp/ristp8` cleanly put demux 0 back on the tuner?
-
-**Yes, on the next zap, with no sticky state and no reboot.**
-
-`ts_src` is recomputed from scratch in `app_normal_play()` on every zap, and
-`dvbnormal_config()` rewrites `cfg_dmx.source` on every play. `echo 0 >
-/tmp/ristp8` and change channel: the URL carries `&tsid:<tuner>` and demux 0 is
-back on the tuner.
-
-The one layer that *is* sticky — `si_filter.c`'s frozen `s_Demux[0].source` —
-is harmless in both directions, because it is only ever written on the first
-open at boot and the player's write is what the hardware actually ends up with.
+`app_play_control.c` is back to stock for the `ts_src` decision. `play->url`
+keeps the **tuner** source deliberately: normal play is suppressed here so the
+URL is unused, and if the tail fails and suppression lifts, a `tsid:3` URL would
+aim demux 0 at a buffer nobody writes. `normal_play.ts_src` is set to 3 only
+*after* the chain hook, for the SI side — `app_time` reads it for the TDT
+subtable (`app_time.c:352` → `gxextra.c:98`).
 
 ---
 
-## What was built
+## PSI passthrough — three answers, not one
 
-### The tail selector gains a third value
+### P1 — does the capture slot SDT/EIT/TDT at all? **Yes, confirmed from the code.**
 
-| `/tmp/ristp8` | `/tmp/ristp8tail` | result |
-|---|---|---|
-| absent / 0 | — | factory decode, untouched |
-| 1 | absent or `player_av` | **Step 1** — `player_av` on the loopback (proven) |
-| 1 | `dmx3` | **Step 2** — reinjection into a spare demux (experiment, unrun) |
-| 1 | `dmx0` | **this** — demux 0 fed from the repaired stream |
+`/tmp/ristp8psi` on (which is now the **default for this tail**) does two things
+in `_rist_capture_begin()`:
 
-Anything unrecognised falls back to `player_av`, so a typo degrades to the path
-that works.
+- `cfg.user_pmt = false` → the broadcast PMT is slotted by the driver
+  (`app_ts_record.c:1305`), instead of the box generating its own PAT/PMT pair.
+- passes `0x0000, 0x0011, 0x0012, 0x0014` as `ext_info.ext_pids`.
 
-### The division of labour, which is the whole design
-
-**`app_play_control.c` sets one variable.** A new branch above the pdmx one,
-guarded by `DVB2IP_SERVER_SUPPORT`:
+Those reach `app_ts_record.c:1326-1350`, which allocates a real slot for each:
 
 ```c
-int p8_dmx0 = app_rist_p8_dmx0_wanted(&prog_node->prog_data);
-if (p8_dmx0)                       g_AppPlayOps.normal_play.ts_src = 3;
-else if (app_program_need_predemux(...)) g_AppPlayOps.normal_play.ts_src = 3;
-else                               g_AppPlayOps.normal_play.ts_src = config.ts_src;
+slot_flags = DMX_REPEAT_MODE|DMX_TSOUT_EN;
+if(_ts_rec_demux_slot_alloc(index, (uint16_t)ext_pid, slot_flags, DEMUX_SLOT_PSI) < 0)
 ```
 
-`dmx_id` is not touched. The pdmx branch is not touched — it is now an `else
-if`, reached identically whenever Part 8's dmx0 tail is off, which is always
-unless someone has echoed `dmx0` into the knob.
+PID 0 is explicitly allowed there (it is the PAT; the blanket `VALID_PID()`
+rejection was moved out for exactly this). `TS_REC_MAX_EXTPID_NUM` is 32, so four
+is not near the limit. **So the slots exist. Without this, EPG and clock off
+demux 0 could not work no matter how demux 0 is opened.**
 
-**`app_rist_capture.c` owns only the memory side.** It never opens or
-configures demux 0. It opens `GXAV_MOD_DVR 0`, configures `src = DVR_INPUT_MEM,
-dst = DVR_OUTPUT_DMX`, runs it, and writes the receiver's output in — the
-sequence in `_GxFrontendNet_TSRConfig()` (`gxfrontend_net.c:118-143`) and its
-writer at `:316/:334`, which is the one complete and readable implementation of
-this direction in the tree.
+### P2 — does EIT survive? **Two answers, and the code now separates them.**
 
-DVR 0 is free while we run: the dmx2 capture opens DVR **2**
-(`app_ts_record.c:1149`). The only other claimant of DVR 0 is
-`GxMedia_DemuxOpen()`, which hardcodes it (`gxmedia_demux.c:138,150`) — that is
-the dmx3 tail, and the two tails are alternatives, never concurrent.
+This box does not ask for now/next only. `gxepg.c:66-76` defaults `epg_day = 3`
+and `cur_tp_only = 1`; `gxepg_table.c:169-192` then walks
+`c_EpgTableId[] = {0x4E, 0x4F, 0x50, 0x60, …}` up to `EPG_TID_60` keeping the
+even indices — so it filters **0x4E (present/following actual)** and **0x50
+(schedule actual)**.
 
-### The screen suppression is INVERTED on this tail
+- **0x4E** is small and repeats every couple of seconds. Nothing in this chain
+  threatens it.
+- **0x50** is the large, low-rate one, and PID 0x0012 carries EIT for *every*
+  service on the transponder, so it is also the highest-volume thing we capture.
+  That is the half that can fail on its own.
 
-Step 1 and Step 2 both take the video decoder away from normal play, so
-`app_rist_screen_enabled()` returns true and `app_normal_play` calls
-`app_player_close(PLAYER_FOR_NORMAL)`.
+**The 2000 ms buffer is not the risk.** RIST buffers and re-orders packets; it
+does not hold sections as units, so a section spanning ten seconds is not
+"overwritten before assembly" — TS packets flow continuously and in order, and
+the loopback hop was proven byte-identical natively. The real risks are upstream:
+the **dmx2 capture slot's hardware buffer overflowing** on a high-rate PID, and
+section CRC (`gxepg_table.c` sets `CRC_FLAG`, so a section missing a packet is
+dropped whole rather than parsed as garbage).
 
-Here normal play **is** the decode path — just sourced from SDRAM. Suppressing
-it would close the very player whose `&tsid:3` URL points demux 0 at memory,
-and nothing would decode at all. So `app_rist_screen_enabled()` returns 0 for
-the dmx0 tail.
+**A bug found while checking this:** the section probe's EIT filter was
+`tid 0x4E mask 0xF0`, which accepts 0x40–0x4F — i.e. it would have shown
+now/next and reported schedule EIT as absent whether or not it arrived. Widened
+to mask **0xE0** (accepts 0x40–0x5F) with a per-table-id histogram, so the log
+now prints:
 
-### Broadcast PSI defaults ON for this tail
+```
+p8sec:     EIT breakdown: now/next (0x4E,0x4F) 41 sections, SCHEDULE (0x50-0x5F) 7 sections
+```
 
-`/tmp/ristp8psi` stays default-off for `player_av` and `dmx3`; on `dmx0` it
-defaults **on**. That is not a preference. `app_sdt`, `app_epg` and `app_time`
-section-filter demux 0, and once demux 0 is fed from memory the only tables
-they can ever see are the ones we captured. Without broadcast PSI the capture
-carries the box's own generated PAT/PMT and no SDT/EIT/TDT at all, so service
-names, EPG and the clock would go stale the moment the tail was selected —
-silently, and looking exactly like a fade.
+and, when only the small one made it:
 
-The "player picks program 0 of 34" risk that kept it off for Step 1 does not
-apply here: the player is handed `vpid`/`apid`/`pcrpid` explicitly on the URL
-and never picks a program out of the PAT.
+```
+p8sec:     -> now/next EPG only. Schedule EIT is not arriving; check the dmx2 slot for 0x0012 is not overflowing.
+```
 
-### Buffer: 2000 ms
+That is the honest per-table answer this question needs, and it comes from the
+box rather than from me.
 
-Part 8's local pair gets its own default (`RIST_P8_BUFFER_MS`), separate from
-Part 7's 4000. The 4000 is sized for the recovery peer over the public internet
-— multi-NACK depth against a ~985 ms RTT. Part 8's hop is 127.0.0.1 to
-127.0.0.1: no recovery peer, no NACK round trip worth budgeting for, and the
-buffer is paid for twice over in zap-to-picture. `/tmp/ristbuffer` still
-overrides.
+### P3 — TDT for the clock. **Slotted; small and periodic.**
 
-### Fallback
+PID 0x0014, table id 0x70, an 8-byte section every few seconds. Slotted by the
+same ext-pid list, filtered by `extra_sync_time()` (`gxextra.c:98-120`) with
+`crc = CRC_OFF` on `demux_id` 0 (left zero by the `memset`) and
+`ts_src = normal_play.ts_src` — which is why that variable is set to 3 after the
+chain hook. It is the easiest of the three; the probe still counts it rather
+than assuming.
 
-Three layers, all of which end in a normal tuner picture rather than a black
-screen:
-
-1. **Chain failed to spawn** — `chain_active`, `p8_active` and `p8_dmx0_want`
-   are all cleared before `app_normal_play` reads the suppression decision.
-2. **DVR feed failed to start** — `_rist_p8_dmx0_start()` returns <0 with
-   everything released. `app_play_control` then sees `ts_src == 3` with
-   `app_rist_p8_dmx0_asked() && !app_rist_p8_dmx0_active()` and **rebuilds the
-   URL on the tuner source before `GxPlayer_MediaPlay()` is issued**. The
-   failure costs nothing.
-3. **`echo 0 > /tmp/ristp8`** — next zap is factory, per Q2 above.
-
-The existing `screen_failed` / `failed_svc_id` latch still applies, so a
-service that gave up this visit does not immediately restart into the same
-failure. `app_rist_p8_dmx0_wanted()` honours the same latch, so a latched
-service never gets `tsid:3` in its URL either.
-
-Deliberately **no** first-frame watchdog on this tail, unlike dmx3. The decode
-it feeds is normal play, and `screen_failed` already covers "the chain never
-produced a picture" — a second watchdog racing that one would be two mechanisms
-fighting over the same zap.
-
-### Two details taken from the reference rather than assumed
-
-- **Write alignment.** `gxfrontend_net.c:330-331` rounds every write down to a
-  multiple of `TS_PACKET_SIZE*4` (752) and carries the remainder. Our datagrams
-  are 1316 bytes (7×188), which is **not** a multiple of 752, so writing them
-  straight through would hand the hardware a length shape the one working
-  reference deliberately avoids. The reader carries a remainder and writes
-  aligned runs.
-- **No `DVR_FLAG_MEM_NOT_PROTECTED`.** `app_ts_record.c:1163` needs that flag
-  because it runs DMX → MEM and the driver otherwise encrypts the captured
-  buffer at rest — the bug that made the dvb2ip TS body come out as ciphertext.
-  This is the opposite direction and `gxfrontend_net.c` sets no flags at all.
-  Noted in the code because the symptom ("bytes go in, garbage comes out") is
-  identical and it cost a session to diagnose the first time.
-
-### `app_first_play()` is deliberately untouched
-
-`app_first_play()` (`app_play_control.c:2900`) has the same `ts_src` decision
-but **no** `app_rist_play_change()` call — the chain is not started on the boot
-play at all. So a box boots into its last channel on the tuner and the dmx0
-path engages on the first real zap. Adding the hook there would have set
-`tsid:3` with nothing feeding it.
+**Note:** `extra_sync_time()` filters `TDT_TID` only. TOT (0x73, the one that
+carries the local-offset descriptor) is not filtered, so the clock is UTC from
+TDT plus the box's own configured zone — unchanged from today, but worth knowing
+it is not a regression introduced here.
 
 ---
 
 ## Bring-up
 
+### 1. Build and flash
+
+The one command. `install.sh` needs no change for this step — both
+`app_rist_capture.c` and `app_play_control.c` are already in `FILES` and in
+`deploy.manifest` (regenerated and committed), and the build-stamp relocation
+that blocked the last build is in from the previous run. Watch for:
+
+```
+  removed the legacy in-tree build stamp (it tripped the guard below)   [first run only]
+  OK: all 12 changed file(s) are in FILES
+=== cross-build: stb_part8_receiver (ARM) ===
+  cutter linked: rist_pcr_cut_feed present in the symbol table
+  post-strip check: 'PCR-boundary framing ON' present
+=== verify: payloads reached the packed rootfs ===
+  OK: stb_part8_receiver in the image carries the cutter
+```
+
+### 2. Knobs and zap
+
 ```sh
 echo 1 > /tmp/ristp8
 echo dmx0 > /tmp/ristp8tail
+echo 1 > /tmp/ristp8sec      # optional: the per-table SDT/EIT/TDT counts
 # zap away from NCN and back -- the tail is read per zap
 ```
 
-Expected, in order:
+`/tmp/ristp8psi` needs no echo: it defaults on for this tail.
+
+### 3. What serial should show, stage by stage
+
+**Gate and chain**
 
 ```
 [RIST] play_change: chain=ENABLED (default, no /tmp/ristchain)  part8=ON
-[RIST] svc_id=2 -> PART 8 video path (tail=dmx0, normal play stays on demux 0)
+[RIST] svc_id=2 -> PART 8 video path (tail=dmx0, SI consumers to ts_src=3 on demux 0)
 [RIST] p8: tail=dmx0  (demux 0 fed from the repaired stream; consumers stay where they are)
 [RIST] p8: ports cap=6300 local=6400 out=6500  buffer=2000ms  pcr_cut=0x0022 (34)  svc_id=2 prog=N
 [RIST] chain: started stb_part8_receiver pid=...
 [RIST] chain: started ristreceiver pid=...
-[RIST] p8dmx0: STAGE 1 -- DVR 0 open (feeds demux 0)
-[RIST] p8dmx0: STAGE 2 -- DVR 0 running, src=MEM dst=DMX
-[RIST] p8dmx0: reading udp://@127.0.0.1:6500 -> DVR 0 -> demux 0
-[RIST] p8dmx0: demux 0 source is set by the PLAYER from &tsid:3 -- nothing here writes it
-[RIST] p8: broadcast PSI passthrough ON -- user_pmt=false, ext pids 0x0000 0x0011 0x0012 0x0014 ...
-[RIST] p8dmx0: STAGE 3 -- first write ACCEPTED 1504 of 1504 bytes into DVR 0
-[RIST] p8dmx0: T+1000ms rx=... wrote=... werr=0
 ```
 
-`pcr_cut=0x0022` is still the value to check first — if it reads anything else
-the box's PMT disagrees with the headend's analysis and nothing downstream can
-align.
+`pcr_cut=0x0022` is the first thing to check. Anything else and the box's PMT
+disagrees with the headend's analysis — stop there.
 
-What to look at, in this order:
+**Frontend lock and dmx2 capture** (unchanged from today — this is the check that
+opening the tail late preserves)
 
-1. **`rx=` climbing** — the receiver is producing. If it is 0 after 15 s the
-   problem is upstream of the demux entirely; check the sender's `[RUN]
-   ts_pkts/pcrs`.
-2. **`wrote=` climbing with `werr=0`** — the memory feed is accepting. `rx`
-   climbing with `wrote=0` means DVR 0 configured but is not running.
-3. **A picture** — demux 0 decoded from SDRAM. This is U1b.
-4. **Service name, EPG, clock still updating after a minute** — the section
-   filters are firing on the memory-fed demux. **This is U1a**, and it is the
-   thing the whole SI/CAS-off-the-repaired-stream architecture rests on. If the
-   picture is fine but the clock freezes and EPG stops filling, U1a is NO and
-   the answer is worth as much as the picture.
+```
+[RIST] start: frontend LOCKED after Nms
+[RIST] udp: dest = 127.0.0.1:6300  (RIST chain input (fixed))
+[RIST] p8: broadcast PSI passthrough ON -- user_pmt=false, ext pids 0x0000 0x0011 0x0012 0x0014 (+ PMT slotted by the driver)
+[DVB2IP] ... capture active
+```
 
-Revert:
+**Cutter framing**
+
+```
+[INFO] [START] PCR-boundary framing ON, pcr_pid=0x0022 (34)
+[INFO] [RUN] dgrams=... bytes=... ts_pkts=... pcrs=... pre_pcr_dropped=30 resyncs=0 badsync=0 write_err=0
+```
+
+`ts_pkts` and `pcrs` both climbing is the chain working.
+
+**dmx0 memory-fed open, then the consumers**
+
+```
+[RIST] screen: tail=dmx0 -- feeding demux 0 from the receiver instead of player_av
+[RIST] p8tail: STAGE 1 -- module open on dmx0 (source=TS -> DEMUX_SDRAM)
+[RIST] p8tail: STAGE 2 -- configured v=0x0022 a=0x0023 pcr=0x0022 vcodec=0x1 acodec=0x2
+[RIST] p8tail: STAGE 3 -- module started
+[RIST] p8tail: app_epg re-pointed at ts_src=3 on demux 0 (demux 0 is now memory-fed)
+[RIST] p8tail: reading udp://@127.0.0.1:6500 -> dmx0  (first-frame deadline 12000ms)
+[RIST] p8tail: STAGE 4 -- first inject ACCEPTED 1316 of 1316 bytes
+[RIST] p8tail: T+500ms rx=... inj_ok=... busy=... err=0
+[RIST] p8tail: STAGE 6 -- FIRST FRAME at T+...ms (vpts=... stc=...)
+```
+
+**Per-table SI, if `/tmp/ristp8sec=1`**
+
+```
+[RIST] p8sec: 4/4 filters armed on dmx0 (ts_src=DEMUX_SDRAM). Sections below or nothing.
+[RIST] p8sec: *** PAT SECTION on dmx0, 61 bytes: 00 B0 95 00 05 C5 00 00 ***
+[RIST] p8sec:   PAT pid 0x0000: 12 sections, 732 bytes  (positive control)
+[RIST] p8sec:   SDT pid 0x0011: 4 sections, ...  (app_sdt / service names)
+[RIST] p8sec:   EIT pid 0x0012: 48 sections, ... (app_epg (0x4E now/next + 0x50 schedule))
+[RIST] p8sec:     EIT breakdown: now/next (0x4E,0x4F) 41 sections, SCHEDULE (0x50-0x5F) 7 sections
+[RIST] p8sec:   TDT pid 0x0014: 6 sections, ...  (app_time)
+```
+
+**The three consumer answers, from the box not the log**
+
+1. **Decode** — picture on screen, and `STAGE 6 -- FIRST FRAME`.
+2. **app_epg** — open the EPG after a minute. Now/next populated is one answer;
+   schedule populated is a second. The `EIT breakdown` line above says which
+   should be possible.
+3. **app_time** — the clock keeps ticking and survives a channel change.
+
+### 4. Reverting
 
 ```sh
-echo player_av > /tmp/ristp8tail   # back to Step 1, next zap
-echo 0 > /tmp/ristp8               # back to factory decode, next zap
+echo player_av > /tmp/ristp8tail   # Step 1 loopback picture, next zap
+echo 0 > /tmp/ristp8               # factory, next zap
 ```
+
+Either way the teardown logs the restore:
+
+```
+[RIST] p8tail: dmx0 module closed
+[RIST] p8tail: demux 0 restored to the tuner (source=0)
+[RIST] p8tail: app_epg re-pointed at ts_src=0 on demux 0 (tail down -- back on the tuner)
+```
+
+If `RESTORE FAILED` ever appears, the next zap's lock poll will time out on the
+delay1 ceiling on every channel — that line is the one to grep for if the box
+starts feeling slow to zap after a Part 8 session.
 
 ---
 
-## What I have not done
+## Did decode, EPG and the clock all come up? — the honest answer
 
-**I have not run any of this.** No box, no way to exercise the media API, the
-demux or the decoder off-hardware. Nothing above should be read as a claim that
-demux 0 decodes from memory, that the DVR accepts our writes, or that section
-filters fire on it.
+**I have not run any of it.** No box, and none of this can be exercised
+off-hardware: the media API, the demux instance, the decoder and the SI stack are
+all SDK and silicon. Nothing above is a claim that demux 0 decodes from memory,
+that `app_epg` gets its tables off it, or that the clock follows.
 
-What is established is the reasoning, and it is quoted from the tree rather
-than inferred: the `(dmx_id, ts)` keying that rules out the direct approach, the
-unconditional source write in `dvbsource_normal.c` that makes the URL the right
-lever, the pdmx branch that already does exactly this, and the DVR
-MEM → DMX sequence copied from the one working reference.
+Those are **three separate answers** and the build is instrumented to give three
+separate answers rather than one blanket result — a picture with a frozen clock,
+or a clock with now/next EPG and no schedule, are all distinguishable outcomes in
+the log above and all worth as much as a clean pass.
 
-The serial log above is what turns that into an answer.
+What is established, and quoted from the tree rather than inferred: the
+refcounted-singleton demux handle that makes slot ordering a non-issue
+(`gxavdev.c:62-86`); that `app_epg` is the only consumer that writes the source
+(`gxepg_table.c:123`) and where its ordering constraint comes from; that the
+TS-sync half of the lock check reads the NIM's demux (`gxfrontend.c:2352`), which
+is why the tail opens after the capture and why teardown restores by hand; and
+that the PSI ext-pids really are slotted (`app_ts_record.c:1326-1350`).
 
-Still open and unchanged: **U1a**, and **G2** (a real box-vs-headend TS diff,
-which needs an STB capture I cannot produce).
+Still not in this step: sync / PCR-sequence anchor, recovery peer, NACK, error
+detection, CAS descramble. The box uses its own numbering.
+
+Still open: **G2** — a real box-vs-headend TS diff, which needs an STB capture I
+cannot produce.
