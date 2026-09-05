@@ -146,83 +146,116 @@ subtable (`app_time.c:352` → `gxextra.c:98`).
 
 ---
 
-## PSI passthrough — three answers, not one
+## PSI — the capture carries the broadcast tables, and it is not a mode
 
-### P1 — does the capture slot SDT/EIT/TDT at all? **Yes, confirmed from the code.**
+### P1, rebuilt — this is not "add SI on top of injected PSI"
 
-`/tmp/ristp8psi` on (which is now the **default for this tail**) does two things
-in `_rist_capture_begin()`:
+The earlier answer was the wrong shape. It described adding SDT/EIT/TDT as extra
+PIDs *alongside* the box's injected PAT/PMT. That is not what Part 8 needs.
 
-- `cfg.user_pmt = false` → the broadcast PMT is slotted by the driver
-  (`app_ts_record.c:1305`), instead of the box generating its own PAT/PMT pair.
-- passes `0x0000, 0x0011, 0x0012, 0x0014` as `ext_info.ext_pids`.
+**`user_pmt = false`, unconditionally, whenever the Part 8 path is on.**
+`/tmp/ristp8psi` is retired — a knob there could only ever select "cut different
+bytes from the headend", which is never a thing anyone wants.
 
-Those reach `app_ts_record.c:1326-1350`, which allocates a real slot for each:
+**Why it cannot be optional.** The sequence numbering has to match the headend,
+and the headend cuts the **broadcast** stream: `part8_recovery_server` is fed by
+`tsp -P filter --pid …` over a fixed PSI set plus this service's PMT/PCR/ES. If
+the box carried its own injected PAT/PMT the two ends would be packetising
+*different bytes*, and no sequence number could ever line up — not a tuning
+problem, an arithmetic impossibility. The broadcast PSI is part of what gets cut
+and numbered.
 
-```c
-slot_flags = DMX_REPEAT_MODE|DMX_TSOUT_EN;
-if(_ts_rec_demux_slot_alloc(index, (uint16_t)ext_pid, slot_flags, DEMUX_SLOT_PSI) < 0)
-```
+This is the **opposite** of the Part 7 capture (`user_pmt = true`), which injects
+because it has no byte-level counterpart to match. The injected-PSI shape is a
+Part 7 artifact.
 
-PID 0 is explicitly allowed there (it is the PAT; the blanket `VALID_PID()`
-rejection was moved out for exactly this). `TS_REC_MAX_EXTPID_NUM` is 32, so four
-is not near the limit. **So the slots exist. Without this, EPG and clock off
-demux 0 could not work no matter how demux 0 is opened.**
+**And rebuilding the answer against that turned up a real mismatch in what was
+already committed.** The previous four-PID set — PAT/SDT/EIT/TDT — was chosen for
+*what the consumers need*, which is the wrong question. The headend filters
+**seven** (`P8_PSI_PIDS = '0,1,16,17,18,19,20'`,
+`rist-monitor/services/part8-service.php:57`):
 
-### P2 — does EIT survive? **Two answers, and the code now separates them.**
+| PID | table | was in the box's set? |
+|---|---|---|
+| 0x00 | PAT | yes |
+| **0x01** | **CAT** | **no — would have diverged** |
+| **0x10** | **NIT** | **no — would have diverged** |
+| 0x11 | SDT | yes |
+| 0x12 | EIT | yes |
+| **0x13** | **RST** | **no — would have diverged** |
+| 0x14 | TDT | yes |
 
-This box does not ask for now/next only. `gxepg.c:66-76` defaults `epg_day = 3`
-and `cur_tp_only = 1`; `gxepg_table.c:169-192` then walks
-`c_EpgTableId[] = {0x4E, 0x4F, 0x50, 0x60, …}` up to `EPG_TID_60` keeping the
-even indices — so it filters **0x4E (present/following actual)** and **0x50
-(schedule actual)**.
+The box now captures the same seven, plus the broadcast PMT (slotted by
+`user_pmt = false` — `app_ts_record.c:1302-1310`) and the service's PCR/video/
+audio. Four would have differed from the server at 0x01/0x10/0x13 wherever this
+transponder carries them.
 
-- **0x4E** is small and repeats every couple of seconds. Nothing in this chain
-  threatens it.
-- **0x50** is the large, low-rate one, and PID 0x0012 carries EIT for *every*
-  service on the transponder, so it is also the highest-volume thing we capture.
-  That is the half that can fail on its own.
+**One capture, both jobs.** The cutter gets bytes it can number identically to
+the server; dmx0 gets the SDT/EIT/TDT that `app_epg` and `app_time` read off the
+repaired stream. There is no second PSI path and no mode to get wrong.
 
-**The 2000 ms buffer is not the risk.** RIST buffers and re-orders packets; it
-does not hold sections as units, so a section spanning ten seconds is not
-"overwritten before assembly" — TS packets flow continuously and in order, and
-the loopback hop was proven byte-identical natively. The real risks are upstream:
-the **dmx2 capture slot's hardware buffer overflowing** on a high-rate PID, and
-section CRC (`gxepg_table.c` sets `CRC_FLAG`, so a section missing a packet is
-dropped whole rather than parsed as garbage).
+The slots are real, not asserted: `app_ts_record.c:1326-1350` allocates a
+`DEMUX_SLOT_PSI` slot per ext PID with `DMX_REPEAT_MODE|DMX_TSOUT_EN`, PID 0
+explicitly allowed. `TS_REC_MAX_EXTPID_NUM` is 32, so seven is not near the limit.
 
-**A bug found while checking this:** the section probe's EIT filter was
-`tid 0x4E mask 0xF0`, which accepts 0x40–0x4F — i.e. it would have shown
-now/next and reported schedule EIT as absent whether or not it arrived. Widened
-to mask **0xE0** (accepts 0x40–0x5F) with a per-table-id histogram, so the log
-now prints:
+### Two consequences I am naming rather than leaving to be discovered
+
+**The ES half of the alignment is still open.** The PSI half now matches the
+headend exactly. The ES half matches only for a service with one video and one
+audio: the headend filters *every* stream the service declares, while this
+capture slots video + **current** audio + PCR. A second audio track, subtitles or
+teletext would be in the server's cut and not in ours. Harmless for Step 1 and
+for the dmx0 tail's own decode — it must be closed before the sequence anchor is
+trusted.
+
+**The `player_av` tail can now show the wrong service.** It receives the
+broadcast PAT, which lists the whole transponder while only this service's PMT
+and ES are captured, so a player that picks `program[0]` can land on a service
+that was never slotted. That is the one path this change can degrade, and it
+logs a NOTE when that tail is selected. **dmx0 and dmx3 are immune** —
+`GxMedia_DemuxConfig()` is handed `vidPid`/`audPid`/`pcrPid` explicitly and never
+reads a PAT.
+
+### P2 — full schedule EPG, not now/next only
+
+**The earlier framing was wrong and is withdrawn.** The RIST buffer is a **delay
+line, not a lossy cache**. Every packet that enters leaves 2000 ms later, in
+order. Nothing is evicted for being large or low-rate, sections are never held or
+reassembled inside the buffer, and `app_epg` assembles 0x50 off dmx0 exactly as
+it always did off the tuner — it was already assembling sections spread over many
+seconds. Buffer depth governs how much **recovery time** there is, never which
+data survives.
+
+So full schedule EPG is expected to work. This box filters **0x4E** (p/f actual)
+and **0x50** (schedule actual) — `gxepg.c:66-76` defaults `epg_day = 3` and
+`cur_tp_only = 1`, and `gxepg_table.c:169-192` walks `c_EpgTableId[]` keeping the
+even indices.
+
+The probe's per-table-id breakdown stays, but as **instrumentation, not a
+predicted limitation** — counting 0x4E and 0x50 separately is what turns "EPG
+works" into an answer rather than an impression:
 
 ```
 p8sec:     EIT breakdown: now/next (0x4E,0x4F) 41 sections, SCHEDULE (0x50-0x5F) 7 sections
 ```
 
-and, when only the small one made it:
+*(A bug fixed along the way: the probe's EIT filter was `mask 0xF0`, accepting
+only 0x40–0x4F, so it would have reported schedule EIT as absent whether or not
+it arrived. Widened to `0xE0`.)* If 0x50 is genuinely absent the log now says
+plainly that it is **not** a buffer effect and points at the dmx2 slot or the
+transponder itself.
 
-```
-p8sec:     -> now/next EPG only. Schedule EIT is not arriving; check the dmx2 slot for 0x0012 is not overflowing.
-```
+### P3 — TDT for the clock
 
-That is the honest per-table answer this question needs, and it comes from the
-box rather than from me.
-
-### P3 — TDT for the clock. **Slotted; small and periodic.**
-
-PID 0x0014, table id 0x70, an 8-byte section every few seconds. Slotted by the
-same ext-pid list, filtered by `extra_sync_time()` (`gxextra.c:98-120`) with
+PID 0x0014, table id 0x70, an 8-byte section every few seconds, slotted by the
+same seven-PID list. Filtered by `extra_sync_time()` (`gxextra.c:98-120`) with
 `crc = CRC_OFF` on `demux_id` 0 (left zero by the `memset`) and
 `ts_src = normal_play.ts_src` — which is why that variable is set to 3 after the
-chain hook. It is the easiest of the three; the probe still counts it rather
-than assuming.
+chain hook.
 
-**Note:** `extra_sync_time()` filters `TDT_TID` only. TOT (0x73, the one that
-carries the local-offset descriptor) is not filtered, so the clock is UTC from
-TDT plus the box's own configured zone — unchanged from today, but worth knowing
-it is not a regression introduced here.
+**Note:** `extra_sync_time()` filters TDT only, not TOT (0x73, which carries the
+local-offset descriptor). The clock is UTC from TDT plus the box's configured
+zone — unchanged from today, not a regression introduced here.
 
 ---
 
@@ -250,11 +283,12 @@ that blocked the last build is in from the previous run. Watch for:
 ```sh
 echo 1 > /tmp/ristp8
 echo dmx0 > /tmp/ristp8tail
-echo 1 > /tmp/ristp8sec      # optional: the per-table SDT/EIT/TDT counts
+echo 1 > /tmp/ristp8sec      # optional: the per-table SDT/EIT/TDT counts off dmx0
 # zap away from NCN and back -- the tail is read per zap
 ```
 
-`/tmp/ristp8psi` needs no echo: it defaults on for this tail.
+There is no PSI knob any more. Broadcast PSI is what the Part 8 capture
+takes, always.
 
 ### 3. What serial should show, stage by stage
 
@@ -278,7 +312,8 @@ opening the tail late preserves)
 ```
 [RIST] start: frontend LOCKED after Nms
 [RIST] udp: dest = 127.0.0.1:6300  (RIST chain input (fixed))
-[RIST] p8: broadcast PSI passthrough ON -- user_pmt=false, ext pids 0x0000 0x0011 0x0012 0x0014 (+ PMT slotted by the driver)
+[RIST] p8: BROADCAST PSI capture (user_pmt=false) -- PAT 0x0000 CAT 0x0001 NIT 0x0010 SDT 0x0011 EIT 0x0012 RST 0x0013 TDT 0x0014
+[RIST] p8:   + broadcast PMT 0x008E, PCR 0x0022, video 0x0022, audio 0x0023  -- the same bytes the headend cuts
 [DVB2IP] ... capture active
 ```
 
