@@ -51,13 +51,19 @@
 
 #include "pcr_cut.h"
 
-/* SO_RCVBUF request. Was 1MB, sized for the per-service Part 8 capture. The box
- * now feeds this the WHOLE TRANSPONDER -- 59 Mb/s measured, 7.4 MB/s -- at which
- * 1MB is ~135ms of headroom and one scheduling hiccup in this process silently
- * costs datagrams on loopback. 4MB is ~540ms and matches the sender's
- * SO_SNDBUF. The kernel clamps to net.core.rmem_max, so what matters is the
- * GRANTED value logged below, not this number. */
-#define P8_RECV_BUF          (4 * 1024 * 1024)
+/* SO_RCVBUF request. Went 1MB -> 4MB for whole-TP, and that was a mistake on
+ * this hardware: the kernel doubles what it accepts, so 4MB became a granted
+ * 8388608, and the box's OOM dump reports managed:54472kB with free:3060kB
+ * against a min watermark of 3072kB. Together with the other buffers raised in
+ * the same build it added ~17MB to a box with 3MB spare and the OOM killer took
+ * THIS PROCESS mid-run -- which showed up downstream as "chain up, no video",
+ * three stages from the cause.
+ *
+ * Back to 1MB (granted ~2MB, ~270ms at 59 Mb/s). Loopback with a 2MB kernel
+ * buffer on the far side has never dropped here; memory has. The granted value
+ * is logged below, and that is the number to watch if datagrams start going
+ * missing. */
+#define P8_RECV_BUF          (1024 * 1024)
 /* One UDP datagram. RIST_MAX_PACKET_SIZE is private to librist, and the box's
  * reader emits 1316-byte chunks anyway; this is just a ceiling. */
 #define P8_READ_MAX          65536
@@ -211,10 +217,11 @@ int main(int argc, char *argv[])
 			rist_log(&logging_settings, RIST_LOG_INFO,
 				"[IN] bound %s:%u  rcvbuf asked %d got %d (%d ms at 59 Mb/s)\n",
 				host, (unsigned)port, want, got, got / 7400);
-			if (got < 2 * 1024 * 1024)
+			if (got < 512 * 1024)
 				rist_log(&logging_settings, RIST_LOG_WARN,
-					"[IN] rcvbuf %d is under 2MB -- net.core.rmem_max is clamping us. "
-					"At whole-TP rates this hop will shed under load.\n", got);
+					"[IN] rcvbuf %d is under 512KB -- net.core.rmem_max is clamping us. "
+					"Raise it only if datagrams actually go missing; on 54MB of RAM "
+					"socket memory is not free.\n", got);
 		}
 	}
 
