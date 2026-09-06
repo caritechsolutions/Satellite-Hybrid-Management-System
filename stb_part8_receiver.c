@@ -51,7 +51,13 @@
 
 #include "pcr_cut.h"
 
-#define P8_RECV_BUF          (1024 * 1024)   /* SO_RCVBUF request */
+/* SO_RCVBUF request. Was 1MB, sized for the per-service Part 8 capture. The box
+ * now feeds this the WHOLE TRANSPONDER -- 59 Mb/s measured, 7.4 MB/s -- at which
+ * 1MB is ~135ms of headroom and one scheduling hiccup in this process silently
+ * costs datagrams on loopback. 4MB is ~540ms and matches the sender's
+ * SO_SNDBUF. The kernel clamps to net.core.rmem_max, so what matters is the
+ * GRANTED value logged below, not this number. */
+#define P8_RECV_BUF          (4 * 1024 * 1024)
 /* One UDP datagram. RIST_MAX_PACKET_SIZE is private to librist, and the box's
  * reader emits 1316-byte chunks anyway; this is just a ceiling. */
 #define P8_READ_MAX          65536
@@ -203,8 +209,12 @@ int main(int argc, char *argv[])
 				rist_log(&logging_settings, RIST_LOG_WARN, "SO_RCVBUF: %s\n", strerror(errno));
 			getsockopt(sd, SOL_SOCKET, SO_RCVBUF, &got, &glen);
 			rist_log(&logging_settings, RIST_LOG_INFO,
-				"[IN] bound %s:%u  rcvbuf asked %d got %d\n",
-				host, (unsigned)port, want, got);
+				"[IN] bound %s:%u  rcvbuf asked %d got %d (%d ms at 59 Mb/s)\n",
+				host, (unsigned)port, want, got, got / 7400);
+			if (got < 2 * 1024 * 1024)
+				rist_log(&logging_settings, RIST_LOG_WARN,
+					"[IN] rcvbuf %d is under 2MB -- net.core.rmem_max is clamping us. "
+					"At whole-TP rates this hop will shed under load.\n", got);
 		}
 	}
 
